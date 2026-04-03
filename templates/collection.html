@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+
+{% block title %}{{ collection.name }} — PubMed AI{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{{ url_for('static', filename='collection.css') }}">
+{% endblock %}
+
+{% block header %}
+<div class="header-top">
+  <a class="back" href="/collections">&larr; Collections</a>
+  <h1>{{ collection.name }}</h1>
+</div>
+<div class="meta">
+  "{{ collection.user_query }}" &mdash;
+  {{ collection.article_count }} articles ({{ collection.full_text_count }} full text) &middot;
+  {{ collection.chunk_count }} chunks &mdash; {{ collection.created_at[:10] }}
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="layout">
+  <!-- Left: article list -->
+  <div class="articles-panel">
+    <div class="panel-title">{{ collection.article_count }} Articles &middot; {{ collection.full_text_count }} Full Text &middot; {{ collection.chunk_count }} Chunks</div>
+    {% for art in articles %}
+    <div class="art-item" id="art-{{ art.pmid }}">
+      <div class="art-num">
+        #{{ loop.index }} &middot; PMID {{ art.pmid }}
+        {% if art.has_full_text %}<span style="margin-left:.4rem;font-size:.65rem;background:#d4edda;color:#155724;padding:.1rem .4rem;border-radius:8px;font-weight:700;">Full Text</span>{% endif %}
+      </div>
+      <div class="art-title">
+        <a href="{{ art.url }}" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;">{{ art.title }}</a>
+      </div>
+      <div class="art-meta">{{ art.journal }}{% if art.year %} &middot; {{ art.year }}{% endif %}</div>
+    </div>
+    {% endfor %}
+  </div>
+
+  <!-- Right: chat -->
+  <div class="chat-panel">
+    <div class="chat-messages" id="chat-messages">
+      <div class="empty-chat" id="empty-hint">
+        <div class="icon">&#128270;</div>
+        <div>Ask a question about this collection of {{ collection.article_count }} articles</div>
+        <div style="font-size:.8rem;color:#bbb">Claude answers using article chunks (full text where available) and cites sources</div>
+        {% if starter_questions %}
+        <div class="suggestions-row" style="justify-content:center;margin-top:1rem;">
+          {% for q in starter_questions %}
+          <button class="suggestion-chip starter-chip">{{ q }}</button>
+          {% endfor %}
+        </div>
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="ask-status" id="ask-status">
+      <div class="ask-step" id="step-embed"><span class="dot"></span>Embedding question</div>
+      <div class="ask-step" id="step-search"><span class="dot"></span>Searching collection</div>
+      <div class="ask-step" id="step-generate"><span class="dot"></span>Generating answer</div>
+    </div>
+
+    <div class="chat-input-bar">
+      <input id="question" type="text"
+             placeholder="e.g. What are the main findings on sleep and memory consolidation?"
+             autocomplete="off">
+      <button class="btn-ask" id="btn-ask">Ask</button>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>const COLLECTION_ID = {{ collection.id }};</script>
+<script src="https://cdn.jsdelivr.net/npm/marked@9/marked.min.js"></script>
+<script src="{{ url_for('static', filename='collection.js') }}"></script>
+{% endblock %}

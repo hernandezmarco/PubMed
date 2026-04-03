@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+
+{% block title %}RAG Collections — PubMed AI{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{{ url_for('static', filename='collections.css') }}">
+{% endblock %}
+
+{% block header %}
+<a class="back" href="/">&larr; Back to Search</a>
+<h1>RAG Collections</h1>
+<p>Semantic knowledge bases built from PubMed searches</p>
+{% endblock %}
+
+{% block content %}
+<div class="container">
+  {% if collections %}
+  <div class="grid">
+    {% for col in collections %}
+    <div class="card" id="card-{{ col.id }}">
+      <div class="card-body">
+        <div class="card-name">{{ col.name }}</div>
+        <div class="card-query">"{{ col.user_query }}"</div>
+        <div class="card-meta">
+          <span class="badge">{{ col.article_count }} articles</span>
+          <span class="badge">{{ col.full_text_count }} full text</span>
+          <span class="badge">{{ col.chunk_count }} chunks</span>
+          {{ col.created_at[:10] }}
+        </div>
+      </div>
+      <div class="card-actions">
+        <a class="btn btn-open" href="/collections/{{ col.id }}">Open &rarr;</a>
+        <button class="btn btn-delete" onclick="deleteCollection({{ col.id }})">Delete</button>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty">
+    <p>No collections yet.</p>
+    <p style="margin-top:.5rem"><a href="/">Run a search</a> and save the results as a collection.</p>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="{{ url_for('static', filename='collections.js') }}"></script>
+{% endblock %}

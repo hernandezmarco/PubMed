@@ -57,6 +57,9 @@ client = anthropic.Anthropic()
 
 PUBMED_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 
+ALLOWED_MODELS = {"claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"}
+DEFAULT_MODEL  = "claude-opus-4-6"
+
 # ── Embeddings ────────────────────────────────────────────────────────────────
 
 _embedder = None
@@ -131,10 +134,45 @@ def build_pubmed_query(english_query: str) -> str:
     return result
 
 
+# ── NCBI request helper with retry / back-off ─────────────────────────────────
+
+def _ncbi_get(url: str, params: dict, timeout: int, max_retries: int = 4) -> requests.Response:
+    """GET with exponential back-off on transient NCBI errors (429, 5xx, timeouts).
+
+    Delays: 1 s, 2 s, 4 s, 8 s (doubles each attempt, capped at 30 s).
+    Raises the last exception if all retries are exhausted.
+    """
+    delay = 1.0
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.get(url, params=params, timeout=timeout)
+            if resp.status_code == 429 or resp.status_code >= 500:
+                raise requests.HTTPError(response=resp)
+            return resp
+        except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as exc:
+            _ncbi_handle_retry(url, attempt, max_retries, delay, exc)
+            time.sleep(delay)
+            delay = min(delay * 2, 30.0)
+
+
+def _ncbi_handle_retry(url: str, attempt: int, max_retries: int, delay: float, exc: Exception):
+    """Log and raise on final attempt, or log a warning and allow retry."""
+    if attempt == max_retries:
+        _api_log.error(
+            "op=ncbi_get url=%s attempt=%d/%d FAILED: %s",
+            url, attempt + 1, max_retries + 1, exc,
+        )
+        raise exc
+    _api_log.warning(
+        "op=ncbi_get url=%s attempt=%d/%d retrying in %.0fs: %s",
+        url, attempt + 1, max_retries + 1, delay, exc,
+    )
+
+
 def search_pubmed(query: str, max_results: int = 25) -> list[str]:
     _api_log.debug("op=esearch query=%r max=%d", query[:120], max_results)
     t0 = time.perf_counter()
-    resp = requests.get(
+    resp = _ncbi_get(
         f"{PUBMED_BASE}/esearch.fcgi",
         params={"db": "pubmed", "term": query, "retmax": max_results, "retmode": "json", "sort": "relevance"},
         timeout=10,
@@ -146,12 +184,62 @@ def search_pubmed(query: str, max_results: int = 25) -> list[str]:
     return ids
 
 
+def _parse_authors(article_node) -> str:
+    authors = []
+    for author in article_node.findall(".//AuthorList/Author"):
+        last = author.findtext("LastName") or ""
+        initials = author.findtext("Initials") or ""
+        collective = author.findtext("CollectiveName") or ""
+        name = f"{last} {initials}".strip() if last else collective
+        if name:
+            authors.append(name)
+    author_str = ", ".join(authors[:6])
+    if len(authors) > 6:
+        author_str += " et al."
+    return author_str or "Unknown"
+
+
+def _parse_abstract(article_node) -> str:
+    parts = []
+    for ab in article_node.findall(".//Abstract/AbstractText"):
+        text = (ab.text or "").strip()
+        if not text:
+            continue
+        label = ab.get("Label")
+        parts.append(f"{label}: {text}" if label else text)
+    return "\n\n".join(parts)
+
+
+def _parse_article(pmid: str, node) -> dict:
+    article = node.find(".//MedlineCitation/Article")
+    title = (article.findtext("ArticleTitle") or "No title").rstrip(".")
+    journal = (
+        article.findtext(".//Journal/Title")
+        or article.findtext(".//Journal/ISOAbbreviation")
+        or ""
+    )
+    year = (
+        article.findtext(".//Journal/JournalIssue/PubDate/Year")
+        or article.findtext(".//Journal/JournalIssue/PubDate/MedlineDate")
+        or ""
+    )[:4]
+    return {
+        "pmid": pmid,
+        "title": title,
+        "authors": _parse_authors(article),
+        "journal": journal,
+        "year": year,
+        "abstract": _parse_abstract(article),
+        "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+    }
+
+
 def fetch_articles(pmids: list[str]) -> list[dict]:
     if not pmids:
         return []
     _api_log.debug("op=efetch pmids=%d", len(pmids))
     t0 = time.perf_counter()
-    resp = requests.get(
+    resp = _ncbi_get(
         f"{PUBMED_BASE}/efetch.fcgi",
         params={"db": "pubmed", "id": ",".join(pmids), "rettype": "abstract", "retmode": "xml"},
         timeout=15,
@@ -160,65 +248,17 @@ def fetch_articles(pmids: list[str]) -> list[dict]:
     _api_log.debug("op=efetch status=%d bytes=%d", resp.status_code, len(resp.content))
     root = ET.fromstring(resp.content)
 
-    nodes_by_pmid = {}
-    for node in root.findall(".//PubmedArticle"):
-        pmid = node.findtext(".//MedlineCitation/PMID")
-        if pmid:
-            nodes_by_pmid[pmid] = node
+    nodes_by_pmid = {
+        node.findtext(".//MedlineCitation/PMID"): node
+        for node in root.findall(".//PubmedArticle")
+        if node.findtext(".//MedlineCitation/PMID")
+    }
 
-    articles = []
-    for pmid in pmids:
-        node = nodes_by_pmid.get(pmid)
-        if node is None:
-            continue
-
-        article = node.find(".//MedlineCitation/Article")
-        title = (article.findtext("ArticleTitle") or "No title").rstrip(".")
-
-        authors = []
-        for author in article.findall(".//AuthorList/Author"):
-            last = author.findtext("LastName") or ""
-            initials = author.findtext("Initials") or ""
-            collective = author.findtext("CollectiveName") or ""
-            name = f"{last} {initials}".strip() if last else collective
-            if name:
-                authors.append(name)
-        author_str = ", ".join(authors[:6])
-        if len(authors) > 6:
-            author_str += " et al."
-
-        journal = (
-            article.findtext(".//Journal/Title")
-            or article.findtext(".//Journal/ISOAbbreviation")
-            or ""
-        )
-
-        year = (
-            article.findtext(".//Journal/JournalIssue/PubDate/Year")
-            or article.findtext(".//Journal/JournalIssue/PubDate/MedlineDate")
-            or ""
-        )[:4]
-
-        abstract_parts = []
-        for ab in article.findall(".//Abstract/AbstractText"):
-            label = ab.get("Label")
-            text = (ab.text or "").strip()
-            if not text:
-                continue
-            abstract_parts.append(f"{label}: {text}" if label else text)
-        abstract = "\n\n".join(abstract_parts) if abstract_parts else ""
-
-        articles.append(
-            {
-                "pmid": pmid,
-                "title": title,
-                "authors": author_str or "Unknown",
-                "journal": journal,
-                "year": year,
-                "abstract": abstract,
-                "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
-            }
-        )
+    articles = [
+        _parse_article(pmid, nodes_by_pmid[pmid])
+        for pmid in pmids
+        if pmid in nodes_by_pmid
+    ]
     elapsed = time.perf_counter() - t0
     _api_log.info("op=efetch parsed=%d duration=%.2fs", len(articles), elapsed)
     return articles
@@ -232,7 +272,7 @@ def get_pmcids(pmids: list[str]) -> dict[str, str]:
         return {}
     _api_log.debug("op=elink pmids=%d", len(pmids))
     t0 = time.perf_counter()
-    resp = requests.get(
+    resp = _ncbi_get(
         f"{PUBMED_BASE}/elink.fcgi",
         params={"dbfrom": "pubmed", "db": "pmc", "linkname": "pubmed_pmc", "id": pmids, "retmode": "json"},
         timeout=15,
@@ -257,7 +297,7 @@ def fetch_pmc_full_text(pmcid: str) -> str:
     """Fetch PMC article XML and return extracted plain text from the body."""
     _api_log.debug("op=pmc_fulltext pmcid=%s", pmcid)
     t0 = time.perf_counter()
-    resp = requests.get(
+    resp = _ncbi_get(
         f"{PUBMED_BASE}/efetch.fcgi",
         params={"db": "pmc", "id": pmcid, "rettype": "full", "retmode": "xml"},
         timeout=30,
@@ -286,6 +326,36 @@ def fetch_pmc_full_text(pmcid: str) -> str:
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
+def _clamp_max_results(raw: str) -> int:
+    value = int(raw) if raw else 25
+    return max(25, min(200, (value // 25) * 25))
+
+
+def _attach_similarities(user_query: str, results: list[dict]):
+    query_emb = embed_texts([user_query])[0]
+    article_texts = [f"{a['title']}. {a['abstract']}" for a in results]
+    article_embs = embed_texts(article_texts)
+    for art, emb in zip(results, article_embs):
+        art["similarity"] = round(cosine_similarity(query_emb, emb), 3)
+
+
+def _run_search(user_query: str, max_results: int) -> tuple[list[dict] | None, str | None, str | None]:
+    """Return (results, pubmed_query, error)."""
+    try:
+        pubmed_query = build_pubmed_query(user_query)
+        pmids = search_pubmed(pubmed_query, max_results)
+        results = fetch_articles(pmids)
+        if results:
+            _attach_similarities(user_query, results)
+        return results, pubmed_query, None
+    except anthropic.AuthenticationError:
+        return None, None, "Invalid Anthropic API key. Set ANTHROPIC_API_KEY in your .env file."
+    except requests.RequestException as exc:
+        return None, None, f"PubMed request failed: {exc}"
+    except Exception as exc:
+        return None, None, str(exc)
+
+
 @app.route("/", methods=["GET", "POST"])
 def index():
     results = None
@@ -297,27 +367,8 @@ def index():
     if request.method == "POST":
         user_query = request.form.get("query", "").strip()
         if user_query:
-            try:
-                max_results = int(request.form.get("max_results", 25))
-                max_results = max(25, min(200, (max_results // 25) * 25))
-                pubmed_query = build_pubmed_query(user_query)
-                pmids = search_pubmed(pubmed_query, max_results)
-                results = fetch_articles(pmids)
-
-                # Compute cosine similarity: user query vs each article
-                if results:
-                    query_emb = embed_texts([user_query])[0]
-                    article_texts = [f"{a['title']}. {a['abstract']}" for a in results]
-                    article_embs = embed_texts(article_texts)
-                    for art, emb in zip(results, article_embs):
-                        art["similarity"] = round(cosine_similarity(query_emb, emb), 3)
-
-            except anthropic.AuthenticationError:
-                error = "Invalid Anthropic API key. Set ANTHROPIC_API_KEY in your .env file."
-            except requests.RequestException as exc:
-                error = f"PubMed request failed: {exc}"
-            except Exception as exc:
-                error = str(exc)
+            max_results = _clamp_max_results(request.form.get("max_results", "25"))
+            results, pubmed_query, error = _run_search(user_query, max_results)
 
     return render_template(
         "index.html",
@@ -352,34 +403,31 @@ def collections_save():
     try:
         pmids = [a["pmid"] for a in articles]
         pmcid_map = get_pmcids(pmids)
-
         cid = db.create_collection(name, user_query, pubmed_query)
-
         for art in articles:
-            pmid = art["pmid"]
-            pmcid = pmcid_map.get(pmid)
-
-            # Attempt full-text download
-            full_text = None
-            if pmcid:
-                try:
-                    full_text = fetch_pmc_full_text(pmcid)
-                except Exception:
-                    pmcid = None
-
-            has_full_text = bool(full_text)
-            db.add_article(cid, art, has_full_text=has_full_text, pmcid=pmcid)
-
-            # Chunk + embed only if not already stored (dedup by PMID)
-            if not db.chunks_exist(pmid):
-                text_to_chunk = full_text if full_text else f"{art['title']}. {art['abstract']}"
-                chunks = chunk_text(text_to_chunk)
-                embeddings = embed_texts(chunks)
-                db.save_chunks(pmid, chunks, embeddings)
-
+            _store_article(cid, art, pmcid_map)
         return {"id": cid}
     except Exception as exc:
         return {"error": str(exc)}, 500
+
+
+def _try_fetch_full_text(pmcid: str) -> tuple[str | None, str | None]:
+    """Return (full_text, pmcid) — pmcid is set to None on fetch failure."""
+    try:
+        return fetch_pmc_full_text(pmcid), pmcid
+    except Exception:
+        return None, None
+
+
+def _store_article(cid: int, art: dict, pmcid_map: dict):
+    pmid = art["pmid"]
+    pmcid = pmcid_map.get(pmid)
+    full_text, pmcid = _try_fetch_full_text(pmcid) if pmcid else (None, None)
+    db.add_article(cid, art, has_full_text=bool(full_text), pmcid=pmcid)
+    if not db.chunks_exist(pmid):
+        text_to_chunk = full_text or f"{art['title']}. {art['abstract']}"
+        chunks = chunk_text(text_to_chunk)
+        db.save_chunks(pmid, chunks, embed_texts(chunks))
 
 
 def generate_starter_questions(user_query: str, articles: list[dict]) -> list[str]:
@@ -409,7 +457,7 @@ def generate_starter_questions(user_query: str, articles: list[dict]) -> list[st
         return []
 
 
-@app.route("/collections/<int:cid>")
+@app.route("/collections/<int:cid>", methods=["GET"])
 def collection_detail(cid: int):
     collection = db.get_collection(cid)
     if not collection:
@@ -424,25 +472,86 @@ def collection_detail(cid: int):
     )
 
 
-@app.route("/collections/<int:cid>/ask", methods=["POST"])
-def collection_ask(cid: int):
-    """SSE endpoint: embeds question, retrieves top-k chunks, streams RAG answer."""
-    data = request.get_json(force=True)
-    question = (data.get("question") or "").strip()
-    if not question:
-        return {"error": "No question provided."}, 400
+_RAG_SYSTEM = (
+    "You are a biomedical research assistant. Answer the user's question using "
+    "ONLY the numbered article excerpts provided. Cite sources inline as [1], [2], etc. "
+    "Be concise and precise. If the excerpts lack sufficient information, say so.\n\n"
+    "After your answer output a line containing only === followed immediately by a "
+    "JSON array of exactly 4 concise follow-up questions the user might ask next, "
+    "based on your answer. Example:\n"
+    "===\n"
+    "[\"Question one?\", \"Question two?\", \"Question three?\", \"Question four?\"]"
+)
 
-    q_emb = embed_texts([question])[0]
-    top_chunks = db.semantic_search(cid, q_emb, k=5)
 
-    if not top_chunks:
-        def empty():
-            yield f"data: {json.dumps({'text': 'No articles found in this collection.'})}\n\n"
-            yield f"data: {json.dumps({'done': True, 'citations': []})}\n\n"
-        return Response(empty(), mimetype="text/event-stream",
-                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+def _sse_emit(payload: dict) -> str:
+    return f"data: {json.dumps(payload)}\n\n"
 
-    # Build context from chunks; deduplicate citations by PMID
+
+def _parse_suggestions(raw: str) -> list[str]:
+    try:
+        return json.loads(raw.strip())[:4]
+    except Exception:
+        return []
+
+
+def _stream_delimited_response(
+    model: str, context: str, question: str, delim: str, emit
+) -> tuple[list[str], str]:
+    """Stream a Claude response split by *delim*.
+
+    Returns (sse_events, post_delimiter_text).
+    """
+    pre = ""
+    post = ""
+    found = False
+    events: list[str] = []
+
+    with client.messages.stream(
+        model=model,
+        max_tokens=2560,
+        system=_RAG_SYSTEM,
+        messages=[{"role": "user", "content": f"Articles:\n\n{context}\n\nQuestion: {question}"}],
+    ) as stream:
+        for text in stream.text_stream:
+            pre, post, found, chunk_events = _advance_delimiter_state(
+                pre, post, found, text, delim, emit
+            )
+            events.extend(chunk_events)
+
+    if not found and pre:
+        events.append(emit({"text": pre}))
+
+    return events, post
+
+
+def _advance_delimiter_state(
+    pre: str, post: str, found: bool, text: str, delim: str, emit
+) -> tuple[str, str, bool, list[str]]:
+    """Process one streamed token; return updated (pre, post, found, new_events)."""
+    events: list[str] = []
+    if found:
+        return pre, post + text, found, events
+
+    pre += text
+    if delim in pre:
+        idx = pre.index(delim)
+        safe = pre[:idx]
+        post = pre[idx + len(delim):]
+        pre = ""
+        if safe:
+            events.append(emit({"text": safe}))
+        return pre, post, True, events
+
+    safe_len = max(0, len(pre) - len(delim) + 1)
+    if safe_len:
+        events.append(emit({"text": pre[:safe_len]}))
+        pre = pre[safe_len:]
+    return pre, post, found, events
+
+
+def _build_rag_context(top_chunks: list[dict]) -> tuple[str, list[dict]]:
+    """Return (context_string, deduplicated_citations)."""
     context_parts = []
     seen_pmids: set[str] = set()
     citations = []
@@ -456,77 +565,51 @@ def collection_ask(cid: int):
         if chunk["pmid"] not in seen_pmids:
             seen_pmids.add(chunk["pmid"])
             citations.append(chunk)
+    return "\n\n".join(context_parts), citations
 
-    context = "\n\n".join(context_parts)
 
-    DELIM = "\n===\n"
+@app.route("/collections/<int:cid>/ask", methods=["POST"])
+def collection_ask(cid: int):
+    """SSE endpoint: embeds question, retrieves top-k chunks, streams RAG answer."""
+    data = request.get_json(force=True)
+    question = (data.get("question") or "").strip()
+    if not question:
+        return {"error": "No question provided."}, 400
+    model = data.get("model", DEFAULT_MODEL)
+    if model not in ALLOWED_MODELS:
+        model = DEFAULT_MODEL
+
+    q_emb = embed_texts([question])[0]
+    top_chunks = db.semantic_search(cid, q_emb, k=5)
+
+    if not top_chunks:
+        def empty():
+            yield f"data: {json.dumps({'text': 'No articles found in this collection.'})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'citations': []})}\n\n"
+        return Response(empty(), mimetype="text/event-stream",
+                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    context, citations = _build_rag_context(top_chunks)
+
+    _DELIM = "\n===\n"
 
     def generate():
-        pre = ""        # text before the delimiter
-        post = ""       # text after the delimiter (suggestions JSON)
-        found = False
         t0 = time.perf_counter()
         _claude_log.debug(
             "op=collection_ask cid=%d chunks=%d question=%r",
             cid, len(top_chunks), question[:120],
         )
+        answer_text, suggestions_json = _stream_delimited_response(
+            model, context, question, _DELIM, _sse_emit
+        )
+        yield from answer_text
 
-        with client.messages.stream(
-            model="claude-opus-4-6",
-            max_tokens=2560,
-            system=(
-                "You are a biomedical research assistant. Answer the user's question using "
-                "ONLY the numbered article excerpts provided. Cite sources inline as [1], [2], etc. "
-                "Be concise and precise. If the excerpts lack sufficient information, say so.\n\n"
-                "After your answer output a line containing only === followed immediately by a "
-                "JSON array of exactly 4 concise follow-up questions the user might ask next, "
-                "based on your answer. Example:\n"
-                "===\n"
-                "[\"Question one?\", \"Question two?\", \"Question three?\", \"Question four?\"]"
-            ),
-            messages=[{
-                "role": "user",
-                "content": f"Articles:\n\n{context}\n\nQuestion: {question}",
-            }],
-        ) as stream:
-            for text in stream.text_stream:
-                if found:
-                    post += text
-                    continue
-
-                pre += text
-
-                if DELIM in pre:
-                    found = True
-                    idx = pre.index(DELIM)
-                    safe = pre[:idx]
-                    post = pre[idx + len(DELIM):]
-                    pre = ""
-                    if safe:
-                        yield f"data: {json.dumps({'text': safe})}\n\n"
-                else:
-                    # Emit safe portion; hold back enough chars for a partial delimiter match
-                    safe_len = max(0, len(pre) - len(DELIM) + 1)
-                    if safe_len:
-                        yield f"data: {json.dumps({'text': pre[:safe_len]})}\n\n"
-                        pre = pre[safe_len:]
-
-        # Flush any remaining pre-delimiter text (delimiter never appeared)
-        if not found and pre:
-            yield f"data: {json.dumps({'text': pre})}\n\n"
-
-        suggestions = []
-        try:
-            suggestions = json.loads(post.strip())[:4]
-        except Exception:
-            pass
-
+        suggestions = _parse_suggestions(suggestions_json)
         elapsed = time.perf_counter() - t0
         _claude_log.info(
             "op=collection_ask cid=%d citations=%d suggestions=%d duration=%.2fs",
             cid, len(citations), len(suggestions), elapsed,
         )
-
         yield f"data: {json.dumps({'done': True, 'citations': citations, 'suggestions': suggestions})}\n\n"
 
     return Response(

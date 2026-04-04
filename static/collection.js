@@ -3,6 +3,18 @@ marked.setOptions({ breaks: true });
 const chatMessages  = document.getElementById('chat-messages');
 const questionInput = document.getElementById('question');
 const btnAsk        = document.getElementById('btn-ask');
+const modelSelect   = document.getElementById('model-select');
+
+// ── Model persistence ─────────────────────────────────────────────────────────
+const MODEL_KEY = 'pubmed_selected_model';
+const savedModel = localStorage.getItem(MODEL_KEY);
+if (savedModel) {
+  const opt = modelSelect.querySelector(`option[value="${savedModel}"]`);
+  if (opt) modelSelect.value = savedModel;
+}
+modelSelect.addEventListener('change', () => {
+  localStorage.setItem(MODEL_KEY, modelSelect.value);
+});
 const askStatus     = document.getElementById('ask-status');
 const stepEls       = {
   embed:    document.getElementById('step-embed'),
@@ -114,7 +126,7 @@ async function ask() {
     const res = await fetch(`/collections/${COLLECTION_ID}/ask`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question }),
+      body: JSON.stringify({ question, model: modelSelect.value }),
     });
 
     setStep('search');

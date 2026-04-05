@@ -568,6 +568,37 @@ def _build_rag_context(top_chunks: list[dict]) -> tuple[str, list[dict]]:
     return "\n\n".join(context_parts), citations
 
 
+def _extract_answer_from_events(events: list[str]) -> str:
+    """Reconstruct plain answer text from SSE event strings."""
+    parts = []
+    for event in events:
+        if not event.startswith("data: "):
+            continue
+        try:
+            payload = json.loads(event[6:].rstrip("\n"))
+            if "text" in payload:
+                parts.append(payload["text"])
+        except Exception:
+            pass
+    return "".join(parts)
+
+
+@app.route("/collections/<int:cid>/conversations", methods=["GET"])
+def collection_conversations(cid: int):
+    return db.list_conversations(cid)
+
+
+@app.route("/conversations/<int:vid>/messages", methods=["GET"])
+def conversation_messages(vid: int):
+    return db.get_conversation_messages(vid)
+
+
+@app.route("/conversations/<int:vid>/delete", methods=["POST"])
+def conversation_delete(vid: int):
+    db.delete_conversation(vid)
+    return {"ok": True}
+
+
 @app.route("/collections/<int:cid>/ask", methods=["POST"])
 def collection_ask(cid: int):
     """SSE endpoint: embeds question, retrieves top-k chunks, streams RAG answer."""
@@ -578,16 +609,28 @@ def collection_ask(cid: int):
     model = data.get("model", DEFAULT_MODEL)
     if model not in ALLOWED_MODELS:
         model = DEFAULT_MODEL
+    conversation_id = data.get("conversation_id")
 
     q_emb = embed_texts([question])[0]
     top_chunks = db.semantic_search(cid, q_emb, k=5)
 
     if not top_chunks:
+        # Still persist the unanswered question so the conversation exists
+        if conversation_id is None:
+            conversation_id = db.create_conversation(cid, question)
+        db.add_message(conversation_id, "user", question)
+        db.add_message(conversation_id, "assistant", "No articles found in this collection.")
+
         def empty():
             yield f"data: {json.dumps({'text': 'No articles found in this collection.'})}\n\n"
-            yield f"data: {json.dumps({'done': True, 'citations': []})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'citations': [], 'conversation_id': conversation_id})}\n\n"
         return Response(empty(), mimetype="text/event-stream",
                         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    # Create / continue conversation
+    if conversation_id is None:
+        conversation_id = db.create_conversation(cid, question)
+    db.add_message(conversation_id, "user", question)
 
     context, citations = _build_rag_context(top_chunks)
 
@@ -604,13 +647,16 @@ def collection_ask(cid: int):
         )
         yield from answer_text
 
+        full_answer = _extract_answer_from_events(answer_text)
+        db.add_message(conversation_id, "assistant", full_answer)
+
         suggestions = _parse_suggestions(suggestions_json)
         elapsed = time.perf_counter() - t0
         _claude_log.info(
-            "op=collection_ask cid=%d citations=%d suggestions=%d duration=%.2fs",
-            cid, len(citations), len(suggestions), elapsed,
+            "op=collection_ask cid=%d vid=%d citations=%d suggestions=%d duration=%.2fs",
+            cid, conversation_id, len(citations), len(suggestions), elapsed,
         )
-        yield f"data: {json.dumps({'done': True, 'citations': citations, 'suggestions': suggestions})}\n\n"
+        yield f"data: {json.dumps({'done': True, 'citations': citations, 'suggestions': suggestions, 'conversation_id': conversation_id})}\n\n"
 
     return Response(
         stream_with_context(generate()),
@@ -629,4 +675,4 @@ def collection_delete(cid: int):
 
 if __name__ == "__main__":
     db.init_db()
-    app.run(debug=True, port=8080)
+    app.run(host="0.0.0.0", debug=True, port=8080)

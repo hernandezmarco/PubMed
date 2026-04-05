@@ -7,7 +7,7 @@ header .meta { font-size: .82rem; opacity: .7; margin-top: .3rem; }
 
 .layout {
   display: grid;
-  grid-template-columns: 340px 1fr;
+  grid-template-columns: 340px 200px 1fr;
   flex: 1;
   min-height: 0;
   height: calc(100vh - 90px);
@@ -39,6 +39,109 @@ header .meta { font-size: .82rem; opacity: .7; margin-top: .3rem; }
 .art-num  { font-size: .7rem; font-weight: 700; color: #aaa; margin-bottom: .2rem; }
 .art-title { font-size: .85rem; font-weight: 600; color: #0f3460; line-height: 1.35; }
 .art-meta  { font-size: .75rem; color: #777; margin-top: .2rem; }
+
+/* ── Middle panel: conversation sidebar ── */
+.conv-sidebar {
+  background: #fafbfc;
+  border-right: 1px solid #e0e4ea;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.conv-sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: .65rem .85rem;
+  border-bottom: 1px solid #e0e4ea;
+  flex-shrink: 0;
+}
+
+.conv-sidebar-title {
+  font-size: .72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: #888;
+}
+
+.btn-new-chat {
+  background: #0f3460;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  width: 22px;
+  height: 22px;
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: background .15s;
+}
+.btn-new-chat:hover { background: #16213e; }
+
+.conv-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: .4rem;
+}
+
+.conv-empty {
+  padding: .75rem .5rem;
+  font-size: .75rem;
+  color: #bbb;
+  text-align: center;
+}
+
+.conv-item {
+  position: relative;
+  padding: .5rem .6rem;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background .15s;
+  margin-bottom: .2rem;
+}
+.conv-item:hover { background: #f0f6ff; }
+.conv-item:hover .conv-delete { opacity: 1; }
+.conv-item.active { background: #e6f0ff; }
+
+.conv-item-title {
+  font-size: .78rem;
+  font-weight: 500;
+  color: #0f3460;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding-right: 18px; /* room for delete btn */
+}
+
+.conv-item-date {
+  font-size: .68rem;
+  color: #aaa;
+  margin-top: .15rem;
+}
+
+.conv-delete {
+  position: absolute;
+  top: 50%;
+  right: .4rem;
+  transform: translateY(-50%);
+  opacity: 0;
+  background: none;
+  border: none;
+  color: #bbb;
+  font-size: .85rem;
+  cursor: pointer;
+  padding: .1rem .25rem;
+  border-radius: 3px;
+  line-height: 1;
+  transition: color .15s, opacity .15s;
+}
+.conv-delete:hover { color: #e74c3c; }
 
 /* ── Right panel: chat ── */
 .chat-panel { display: flex; flex-direction: column; background: #f5f7fa; }
@@ -150,7 +253,7 @@ header .meta { font-size: .82rem; opacity: .7; margin-top: .3rem; }
   display: none;
   position: fixed;
   bottom: 72px; /* sits just above the input bar */
-  left: 340px;
+  left: 540px;
   right: 0;
   z-index: 100;
   padding: .45rem 1.5rem;
@@ -183,7 +286,7 @@ header .meta { font-size: .82rem; opacity: .7; margin-top: .3rem; }
 .chat-input-bar {
   position: fixed;
   bottom: 0;
-  left: 340px;
+  left: 540px;
   right: 0;
   z-index: 100;
   padding: 1rem 1.5rem;

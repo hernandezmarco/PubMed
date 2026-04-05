@@ -88,6 +88,25 @@ def init_db():
             ON article_chunks USING hnsw (embedding vector_cosine_ops)
         """)
 
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS conversations (
+                id            SERIAL PRIMARY KEY,
+                collection_id INTEGER NOT NULL REFERENCES rag_collections(id) ON DELETE CASCADE,
+                title         TEXT NOT NULL,
+                created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS conversation_messages (
+                id              SERIAL PRIMARY KEY,
+                conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                role            TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+                content         TEXT NOT NULL,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+
 
 # ── Write helpers ──────────────────────────────────────────────────────────────
 
@@ -246,3 +265,70 @@ def delete_collection(cid: int):
     with db_conn() as conn:
         conn.cursor().execute("DELETE FROM rag_collections WHERE id = %s", (cid,))
     _log.info("op=delete_collection cid=%d duration=%.3fs", cid, time.perf_counter() - t0)
+
+
+# ── Conversation helpers ───────────────────────────────────────────────────────
+
+def create_conversation(cid: int, title: str) -> int:
+    t0 = time.perf_counter()
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO conversations (collection_id, title) VALUES (%s, %s) RETURNING id",
+            (cid, title[:120]),
+        )
+        vid = cur.fetchone()[0]
+    _log.info("op=create_conversation cid=%d vid=%d duration=%.3fs", cid, vid, time.perf_counter() - t0)
+    return vid
+
+
+def add_message(vid: int, role: str, content: str):
+    t0 = time.perf_counter()
+    with db_conn() as conn:
+        conn.cursor().execute(
+            "INSERT INTO conversation_messages (conversation_id, role, content) VALUES (%s, %s, %s)",
+            (vid, role, content),
+        )
+    _log.debug("op=add_message vid=%d role=%s duration=%.3fs", vid, role, time.perf_counter() - t0)
+
+
+def list_conversations(cid: int) -> list[dict]:
+    t0 = time.perf_counter()
+    with db_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            """
+            SELECT v.id, v.title, v.created_at::text AS created_at,
+                   COUNT(m.id) AS message_count
+            FROM conversations v
+            LEFT JOIN conversation_messages m ON m.conversation_id = v.id
+            WHERE v.collection_id = %s
+            GROUP BY v.id
+            ORDER BY v.created_at DESC
+            """,
+            (cid,),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+    _log.info("op=list_conversations cid=%d rows=%d duration=%.3fs", cid, len(rows), time.perf_counter() - t0)
+    return rows
+
+
+def get_conversation_messages(vid: int) -> list[dict]:
+    t0 = time.perf_counter()
+    with db_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            "SELECT id, role, content, created_at::text AS created_at "
+            "FROM conversation_messages WHERE conversation_id = %s ORDER BY id",
+            (vid,),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+    _log.info("op=get_conversation_messages vid=%d rows=%d duration=%.3fs", vid, len(rows), time.perf_counter() - t0)
+    return rows
+
+
+def delete_conversation(vid: int):
+    t0 = time.perf_counter()
+    with db_conn() as conn:
+        conn.cursor().execute("DELETE FROM conversations WHERE id = %s", (vid,))
+    _log.info("op=delete_conversation vid=%d duration=%.3fs", vid, time.perf_counter() - t0)

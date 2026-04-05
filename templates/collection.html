@@ -46,6 +46,17 @@
     {% endfor %}
   </div>
 
+  <!-- Middle: conversation list -->
+  <div class="conv-sidebar" id="conv-sidebar">
+    <div class="conv-sidebar-header">
+      <span class="conv-sidebar-title">Conversations</span>
+      <button class="btn-new-chat" id="btn-new-chat" title="New conversation">+</button>
+    </div>
+    <div class="conv-list" id="conv-list">
+      <div class="conv-empty">No conversations yet</div>
+    </div>
+  </div>
+
   <!-- Right: chat -->
   <div class="chat-panel">
     <div class="chat-messages" id="chat-messages">
@@ -85,7 +96,10 @@
 {% endblock %}
 
 {% block extra_js %}
-<script>const COLLECTION_ID = {{ collection.id }};</script>
+<script>
+const COLLECTION_ID = {{ collection.id }};
+const STARTER_QUESTIONS = {{ starter_questions | tojson }};
+</script>
 <script src="https://cdn.jsdelivr.net/npm/marked@9/marked.min.js"></script>
 <script src="{{ url_for('static', filename='collection.js') }}"></script>
 {% endblock %}

@@ -10,6 +10,7 @@
 <body>
 <div id="progress-bar"></div>
 <header>{% block header %}{% endblock %}</header>
+{% block breadcrumb %}{% endblock %}
 {% block content %}{% endblock %}
 <script src="{{ url_for('static', filename='base.js') }}"></script>
 {% block extra_js %}{% endblock %}

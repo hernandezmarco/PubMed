@@ -11,6 +11,12 @@
 <p>Ask a research question in plain English — Claude converts it to an optimised PubMed query.</p>
 {% endblock %}
 
+{% block breadcrumb %}
+<nav class="breadcrumb" aria-label="Breadcrumb">
+  <span class="current">PubMed Search</span>
+</nav>
+{% endblock %}
+
 {% block content %}
 <div id="loading-overlay">
   <div class="spinner"></div>

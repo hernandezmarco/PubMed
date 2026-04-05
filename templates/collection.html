@@ -8,7 +8,6 @@
 
 {% block header %}
 <div class="header-top">
-  <a class="back" href="/collections">&larr; Collections</a>
   <h1>{{ collection.name }}</h1>
 </div>
 <div class="meta">
@@ -16,6 +15,16 @@
   {{ collection.article_count }} articles ({{ collection.full_text_count }} full text) &middot;
   {{ collection.chunk_count }} chunks &mdash; {{ collection.created_at[:10] }}
 </div>
+{% endblock %}
+
+{% block breadcrumb %}
+<nav class="breadcrumb" aria-label="Breadcrumb">
+  <a href="/">PubMed Search</a>
+  <span class="sep">/</span>
+  <a href="/collections">Collections</a>
+  <span class="sep">/</span>
+  <span class="current">{{ collection.name }}</span>
+</nav>
 {% endblock %}
 
 {% block content %}

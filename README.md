@@ -112,7 +112,7 @@ docker build -t pubmed-ai .
 ### Run
 
 ```bash
-docker run -p 8080:8080 \
+docker run -p 127.0.0.1:8080:8080 \
   -e ANTHROPIC_API_KEY=sk-ant-... \
   -e DB_HOST=host.docker.internal \
   -e DB_NAME=pubmed_ai \
@@ -125,7 +125,7 @@ docker run -p 8080:8080 \
 
 `DB_HOST=host.docker.internal` connects to a PostgreSQL instance running on your Mac. Replace with a hostname or IP if your database is elsewhere.
 
-> **Note:** Flask binds to `0.0.0.0` inside the container so that Docker's `-p 8080:8080` port mapping reaches it. Without this the container would be unreachable from the host.
+> **Security note:** `-p 127.0.0.1:8080:8080` binds the published port to the host's loopback only — other machines on your LAN cannot reach the app. Using `-p 8080:8080` (without the IP prefix) would publish on all host interfaces. Flask itself must bind to `0.0.0.0` inside the container for Docker's port forwarding to work; this is safe because the container has its own isolated network namespace.
 
 ---
 

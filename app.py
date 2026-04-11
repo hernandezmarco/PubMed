@@ -3,6 +3,7 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
@@ -12,6 +13,8 @@ import anthropic
 import numpy as np
 import requests
 from docx import Document
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 from docx.shared import RGBColor
 from flask import Flask, Response, render_template, request, stream_with_context
 from dotenv import load_dotenv
@@ -500,12 +503,19 @@ def _parse_suggestions(raw: str) -> list[str]:
         return []
 
 
+def _compute_cost(model: str, input_tokens: int, output_tokens: int) -> float:
+    """Return the USD cost for one API call at Anthropic list prices."""
+    pricing = cfg.MODEL_PRICING.get(model, {"input": 0.0, "output": 0.0})
+    return (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1_000_000
+
+
 def _stream_delimited_response(
     model: str, context: str, question: str, delim: str, emit
-) -> tuple[list[str], str]:
+) -> tuple[list[str], str, dict]:
     """Stream a Claude response split by *delim*.
 
-    Returns (sse_events, post_delimiter_text).
+    Returns (sse_events, post_delimiter_text, usage_dict).
+    usage_dict has keys: input_tokens, output_tokens.
     """
     pre = ""
     post = ""
@@ -523,11 +533,16 @@ def _stream_delimited_response(
                 pre, post, found, text, delim, emit
             )
             events.extend(chunk_events)
+        final_msg = stream.get_final_message()
+        usage = {
+            "input_tokens":  final_msg.usage.input_tokens,
+            "output_tokens": final_msg.usage.output_tokens,
+        }
 
     if not found and pre:
         events.append(emit({"text": pre}))
 
-    return events, post
+    return events, post, usage
 
 
 def _advance_delimiter_state(
@@ -668,7 +683,7 @@ def collection_ask(cid: int):
             "op=collection_ask cid=%d chunks=%d question=%r",
             cid, len(top_chunks), question[:120],
         )
-        answer_text, suggestions_json = _stream_delimited_response(
+        answer_text, suggestions_json, usage = _stream_delimited_response(
             model, context, question, _DELIM, _sse_emit
         )
         yield from answer_text
@@ -678,11 +693,20 @@ def collection_ask(cid: int):
 
         suggestions = _parse_suggestions(suggestions_json)
         elapsed = time.perf_counter() - t0
+        cost = _compute_cost(model, usage["input_tokens"], usage["output_tokens"])
+        usage_info = {
+            "model":         model,
+            "input_tokens":  usage["input_tokens"],
+            "output_tokens": usage["output_tokens"],
+            "cost_usd":      round(cost, 6),
+        }
         _claude_log.info(
-            "op=collection_ask cid=%d vid=%d citations=%d suggestions=%d duration=%.2fs",
-            cid, conversation_id, len(stored_citations), len(suggestions), elapsed,
+            "op=collection_ask cid=%d vid=%d citations=%d suggestions=%d "
+            "in_tok=%d out_tok=%d cost_usd=%.6f duration=%.2fs",
+            cid, conversation_id, len(stored_citations), len(suggestions),
+            usage["input_tokens"], usage["output_tokens"], cost, elapsed,
         )
-        yield f"data: {json.dumps({'done': True, 'citations': stored_citations, 'suggestions': suggestions, 'conversation_id': conversation_id})}\n\n"
+        yield f"data: {json.dumps({'done': True, 'citations': stored_citations, 'suggestions': suggestions, 'conversation_id': conversation_id, 'usage': usage_info})}\n\n"
 
     return Response(
         stream_with_context(generate()),
@@ -716,11 +740,31 @@ def _rtf_esc(text: str) -> str:
     return ''.join(out)
 
 
+def _rtf_hyperlink(url: str, text: str) -> str:
+    """Return an RTF field that renders *text* as a clickable hyperlink to *url*."""
+    safe_url = url.replace('\\', '\\\\').replace('{', '\\{').replace('}', '\\}')
+    return (
+        r'{\field{\*\fldinst{HYPERLINK "' + safe_url + r'"}}' +
+        r'{\fldrslt \cf2\ul ' + _rtf_esc(text) + r'}}'
+    )
+
+
+def _rtf_line_with_links(text: str, url_map: dict) -> str:
+    """Escape *text* for RTF, converting [N] markers to hyperlinks via *url_map*."""
+    parts = re.split(r'(\[\d+\])', text)
+    out = []
+    for part in parts:
+        m = re.match(r'^\[(\d+)\]$', part)
+        url = m and url_map.get(int(m.group(1)))
+        out.append(_rtf_hyperlink(url, part) if url else _rtf_esc(part))
+    return ''.join(out)
+
+
 def _build_rtf(title: str, collection_name: str, created_at: str, messages: list[dict]) -> str:
     lines = [
         r'{\rtf1\ansi\ansicpg1252\deff0',
         r'{\fonttbl{\f0\fswiss\fcharset0 Arial;}}',
-        r'{\colortbl;\red15\green52\blue96;}',   # \cf1 = navy
+        r'{\colortbl;\red15\green52\blue96;\red5\green99\blue193;}',  # \cf1=navy \cf2=link-blue
         r'\f0\fs20',
         r'\pard\b\fs28 ' + _rtf_esc(title) + r'\b0\fs20\par',
         r'\pard\i Collection: ' + _rtf_esc(collection_name) + r'\i0\par',
@@ -731,12 +775,67 @@ def _build_rtf(title: str, collection_name: str, created_at: str, messages: list
         if msg['role'] == 'user':
             lines.append(r'\pard\cf1\b You:\b0\cf0 ' + _rtf_esc(msg['content']) + r'\par')
         else:
+            citations = msg.get('citations') or []
+            url_map = {c['num']: c['url'] for c in citations if 'num' in c and 'url' in c}
             lines.append(r'\pard\b Claude:\b0\par')
             for line in msg['content'].split('\n'):
-                lines.append(r'\pard ' + _rtf_esc(line) + r'\par')
+                lines.append(r'\pard ' + _rtf_line_with_links(line, url_map) + r'\par')
+            if citations:
+                lines.append(r'\pard\par\pard\b\fs18 Sources\b0\fs20\par')
+                for c in citations:
+                    num  = c.get('num', '')
+                    url  = c.get('url', '')
+                    ctitle = c.get('title', '')
+                    meta = ''
+                    if c.get('journal'):
+                        meta = f" - {c['journal']}"
+                        if c.get('year'):
+                            meta += f" ({c['year']})"
+                    link = _rtf_hyperlink(url, ctitle) if url else _rtf_esc(ctitle)
+                    lines.append(r'\pard [' + _rtf_esc(str(num)) + '] ' + link + _rtf_esc(meta) + r'\par')
         lines.append(r'\pard\par')
     lines.append('}')
     return '\n'.join(lines)
+
+
+# ── Docx hyperlink helpers ────────────────────────────────────────────────────
+
+def _docx_add_hyperlink(para, url: str, text: str):
+    """Append a clickable hyperlink run to *para*."""
+    r_id = para.part.relate_to(
+        url,
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink",
+        is_external=True,
+    )
+    hl = OxmlElement("w:hyperlink")
+    hl.set(qn("r:id"), r_id)
+
+    run = OxmlElement("w:r")
+    rpr = OxmlElement("w:rPr")
+    color = OxmlElement("w:color")
+    color.set(qn("w:val"), "0563C1")
+    rpr.append(color)
+    u = OxmlElement("w:u")
+    u.set(qn("w:val"), "single")
+    rpr.append(u)
+    run.append(rpr)
+
+    t = OxmlElement("w:t")
+    t.text = text
+    run.append(t)
+    hl.append(run)
+    para._p.append(hl)
+
+
+def _docx_append_with_links(para, text: str, url_map: dict):
+    """Append *text* to *para*, converting [N] markers to hyperlinks."""
+    for part in re.split(r'(\[\d+\])', text):
+        m = re.match(r'^\[(\d+)\]$', part)
+        url = m and url_map.get(int(m.group(1)))
+        if url:
+            _docx_add_hyperlink(para, url, part)
+        else:
+            para.add_run(part)
 
 
 def _build_docx(title: str, collection_name: str, created_at: str, messages: list[dict]) -> io.BytesIO:
@@ -745,7 +844,6 @@ def _build_docx(title: str, collection_name: str, created_at: str, messages: lis
 
     meta = doc.add_paragraph()
     meta.add_run(f'Collection: {collection_name}  |  {created_at[:10]}').italic = True
-
     doc.add_paragraph()
 
     for msg in messages:
@@ -756,16 +854,36 @@ def _build_docx(title: str, collection_name: str, created_at: str, messages: lis
             label.font.color.rgb = RGBColor(0x0F, 0x34, 0x60)
             p.add_run(msg['content'])
         else:
+            citations = msg.get('citations') or []
+            url_map = {c['num']: c['url'] for c in citations if 'num' in c and 'url' in c}
+
             first = True
             for line in msg['content'].split('\n'):
+                p = doc.add_paragraph()
                 if first:
-                    p = doc.add_paragraph()
-                    label = p.add_run('Claude:  ')
-                    label.bold = True
-                    p.add_run(line)
+                    p.add_run('Claude:  ').bold = True
                     first = False
-                else:
-                    doc.add_paragraph(line)
+                _docx_append_with_links(p, line, url_map)
+
+            if citations:
+                src = doc.add_paragraph()
+                src.add_run('Sources:').bold = True
+                for c in citations:
+                    item = doc.add_paragraph()
+                    num  = c.get('num', '')
+                    url  = c.get('url', '')
+                    ctitle = c.get('title', '')
+                    item.add_run(f'[{num}] ')
+                    if url:
+                        _docx_add_hyperlink(item, url, ctitle)
+                    else:
+                        item.add_run(ctitle)
+                    if c.get('journal'):
+                        suffix = f" \u2013 {c['journal']}"
+                        if c.get('year'):
+                            suffix += f" ({c['year']})"
+                        item.add_run(suffix).italic = True
+
         doc.add_paragraph()
 
     buf = io.BytesIO()

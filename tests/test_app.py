@@ -229,6 +229,39 @@ class TestParseSuggestions:
 
 
 
+class TestComputeCost:
+    def test_opus_known_price(self):
+        # 1 M input + 1 M output at $15/$75 per MTok = $90
+        cost = _app._compute_cost("claude-opus-4-6", 1_000_000, 1_000_000)
+        assert cost == pytest.approx(90.0)
+
+    def test_sonnet_known_price(self):
+        cost = _app._compute_cost("claude-sonnet-4-6", 1_000_000, 1_000_000)
+        assert cost == pytest.approx(18.0)
+
+    def test_haiku_known_price(self):
+        cost = _app._compute_cost("claude-haiku-4-5-20251001", 1_000_000, 1_000_000)
+        assert cost == pytest.approx(4.80)
+
+    def test_zero_tokens_is_zero(self):
+        assert _app._compute_cost("claude-sonnet-4-6", 0, 0) == pytest.approx(0.0)
+
+    def test_unknown_model_returns_zero(self):
+        assert _app._compute_cost("unknown-model", 1_000_000, 1_000_000) == pytest.approx(0.0)
+
+    def test_output_weighted_more_than_input(self):
+        # For every model, output tokens cost more than input tokens
+        for model in cfg.ALLOWED_CHAT_MODELS:
+            cost_in  = _app._compute_cost(model, 1_000, 0)
+            cost_out = _app._compute_cost(model, 0, 1_000)
+            assert cost_out > cost_in, f"Output should cost more than input for {model}"
+
+    def test_small_realistic_call(self):
+        # ~2 000 input, ~500 output on Sonnet: (2000*3 + 500*15) / 1e6
+        cost = _app._compute_cost("claude-sonnet-4-6", 2_000, 500)
+        assert cost == pytest.approx((2_000 * 3 + 500 * 15) / 1_000_000)
+
+
 class TestAdvanceDelimiterState:
     DELIM = cfg.RAG_DELIMITER
 
@@ -627,10 +660,64 @@ class TestRtfEsc:
         assert _app._rtf_esc("") == ""
 
 
+class TestRtfHyperlink:
+    def test_contains_hyperlink_keyword(self):
+        result = _app._rtf_hyperlink("https://example.com", "click me")
+        assert "HYPERLINK" in result
+
+    def test_contains_url(self):
+        result = _app._rtf_hyperlink("https://pubmed.ncbi.nlm.nih.gov/123/", "[1]")
+        assert "https://pubmed.ncbi.nlm.nih.gov/123/" in result
+
+    def test_contains_display_text(self):
+        result = _app._rtf_hyperlink("https://example.com", "Article Title")
+        assert "Article Title" in result
+
+    def test_is_ascii_encodable(self):
+        result = _app._rtf_hyperlink("https://example.com", "Title")
+        result.encode("ascii")  # must not raise
+
+    def test_rtf_field_structure(self):
+        result = _app._rtf_hyperlink("https://example.com", "text")
+        assert result.startswith(r"{\field{")
+        assert result.endswith("}}")
+
+
+class TestRtfLineWithLinks:
+    _URL_MAP = {1: "https://pubmed.ncbi.nlm.nih.gov/111/",
+                2: "https://pubmed.ncbi.nlm.nih.gov/222/"}
+
+    def test_plain_text_unchanged(self):
+        result = _app._rtf_line_with_links("No markers here.", {})
+        assert result == "No markers here."
+
+    def test_marker_becomes_hyperlink(self):
+        result = _app._rtf_line_with_links("See [1] for details.", self._URL_MAP)
+        assert "HYPERLINK" in result
+        assert "pubmed.ncbi.nlm.nih.gov/111/" in result
+
+    def test_unknown_marker_stays_plain(self):
+        result = _app._rtf_line_with_links("See [9].", self._URL_MAP)
+        assert "HYPERLINK" not in result
+        assert "[9]" in result
+
+    def test_multiple_markers(self):
+        result = _app._rtf_line_with_links("As shown [1] and [2].", self._URL_MAP)
+        assert result.count("HYPERLINK") == 2
+
+
 class TestBuildRtf:
     _MSGS = [
         {"role": "user",      "content": "What is the treatment?"},
         {"role": "assistant", "content": "It involves X.\nAnd also Y."},
+    ]
+    _CITATION = {"num": 1, "pmid": "111", "title": "Key Article",
+                 "url": "https://pubmed.ncbi.nlm.nih.gov/111/",
+                 "journal": "NEJM", "year": "2024"}
+    _MSGS_WITH_CITATIONS = [
+        {"role": "user",      "content": "What is the treatment?"},
+        {"role": "assistant", "content": "See [1] for details.",
+         "citations": [_CITATION]},
     ]
 
     def test_starts_with_rtf_header(self):
@@ -665,11 +752,53 @@ class TestBuildRtf:
         rtf = _app._build_rtf("Title", "Col", "2024-01-01", self._MSGS)
         rtf.encode("ascii")  # must not raise
 
+    def test_sources_section_present_when_citations(self):
+        rtf = _app._build_rtf("Title", "Col", "2024-01-01", self._MSGS_WITH_CITATIONS)
+        assert "Sources" in rtf
+
+    def test_citation_title_in_sources(self):
+        rtf = _app._build_rtf("Title", "Col", "2024-01-01", self._MSGS_WITH_CITATIONS)
+        assert "Key Article" in rtf
+
+    def test_citation_url_as_hyperlink(self):
+        rtf = _app._build_rtf("Title", "Col", "2024-01-01", self._MSGS_WITH_CITATIONS)
+        assert "pubmed.ncbi.nlm.nih.gov/111/" in rtf
+        assert "HYPERLINK" in rtf
+
+    def test_no_sources_section_without_citations(self):
+        rtf = _app._build_rtf("Title", "Col", "2024-01-01", self._MSGS)
+        assert "Sources" not in rtf
+
+    def test_inline_marker_linked_in_answer(self):
+        rtf = _app._build_rtf("Title", "Col", "2024-01-01", self._MSGS_WITH_CITATIONS)
+        # The [1] in "See [1] for details." should become a hyperlink field
+        assert "HYPERLINK" in rtf
+
+
 class TestBuildDocx:
+    import zipfile as _zf
+    import io as _io
+
     _MSGS = [
         {"role": "user",      "content": "What is the treatment?"},
         {"role": "assistant", "content": "It involves X.\nAnd also Y."},
     ]
+    _CITATION = {"num": 1, "pmid": "111", "title": "Key Article",
+                 "url": "https://pubmed.ncbi.nlm.nih.gov/111/",
+                 "journal": "NEJM", "year": "2024"}
+    _MSGS_WITH_CITATIONS = [
+        {"role": "user",      "content": "What is the treatment?"},
+        {"role": "assistant", "content": "See [1] for details.",
+         "citations": [_CITATION]},
+    ]
+
+    @staticmethod
+    def _docx_xml(buf):
+        import zipfile, io
+        buf.seek(0)
+        with zipfile.ZipFile(io.BytesIO(buf.read())) as z:
+            with z.open("word/document.xml") as f:
+                return f.read().decode("utf-8")
 
     def test_returns_bytes_io(self):
         import io
@@ -684,6 +813,27 @@ class TestBuildDocx:
     def test_non_empty_output(self):
         result = _app._build_docx("Title", "Col", "2024-01-01", self._MSGS)
         assert result.getbuffer().nbytes > 0
+
+    def test_citation_title_in_document_xml(self):
+        result = _app._build_docx("Title", "Col", "2024-01-01", self._MSGS_WITH_CITATIONS)
+        xml = self._docx_xml(result)
+        assert "Key Article" in xml
+
+    def test_citation_url_as_hyperlink_relationship(self):
+        import zipfile, io
+        result = _app._build_docx("Title", "Col", "2024-01-01", self._MSGS_WITH_CITATIONS)
+        result.seek(0)
+        with zipfile.ZipFile(io.BytesIO(result.read())) as z:
+            rels = z.read("word/_rels/document.xml.rels").decode("utf-8")
+        assert "pubmed.ncbi.nlm.nih.gov/111/" in rels
+
+    def test_no_hyperlink_relationships_without_citations(self):
+        import zipfile, io
+        result = _app._build_docx("Title", "Col", "2024-01-01", self._MSGS)
+        result.seek(0)
+        with zipfile.ZipFile(io.BytesIO(result.read())) as z:
+            rels = z.read("word/_rels/document.xml.rels").decode("utf-8")
+        assert "pubmed" not in rels
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

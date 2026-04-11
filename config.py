@@ -21,6 +21,21 @@ ALLOWED_CHAT_MODELS     = {
 
 EMBEDDING_MODEL         = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
 
+# ── Pricing (Anthropic list prices, USD per million tokens) ───────────────────
+
+MODEL_PRICING: dict[str, dict[str, float]] = {
+    "claude-opus-4-6":           {"input": 15.00, "output": 75.00},
+    "claude-sonnet-4-6":         {"input":  3.00, "output": 15.00},
+    "claude-haiku-4-5-20251001": {"input":  0.80, "output":  4.00},
+}
+
+# Short display names shown to users in the UI
+MODEL_SHORT_NAMES: dict[str, str] = {
+    "claude-opus-4-6":           "Opus 4.6",
+    "claude-sonnet-4-6":         "Sonnet 4.6",
+    "claude-haiku-4-5-20251001": "Haiku 4.5",
+}
+
 # ── Generation limits (tokens) ────────────────────────────────────────────────
 
 MAX_TOKENS_PUBMED_QUERY = 512

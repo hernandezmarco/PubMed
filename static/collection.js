@@ -13,6 +13,13 @@ const exportDropdown = document.getElementById('export-dropdown');
 // ── Conversation state ────────────────────────────────────────────────────────
 let currentConversationId = null;
 
+// ── Model display names ───────────────────────────────────────────────────────
+const MODEL_NAMES = {
+  'claude-opus-4-6':           'Opus 4.6',
+  'claude-sonnet-4-6':         'Sonnet 4.6',
+  'claude-haiku-4-5-20251001': 'Haiku 4.5',
+};
+
 // ── Model persistence ─────────────────────────────────────────────────────────
 const MODEL_KEY = 'pubmed_selected_model';
 const savedModel = localStorage.getItem(MODEL_KEY);
@@ -160,7 +167,21 @@ function renderSuggestions(questions) {
   return row;
 }
 
-function finalizeMsgWithCitations(msgEl, citations, suggestions) {
+function renderUsage(usage) {
+  if (!usage) return null;
+  const name  = MODEL_NAMES[usage.model] || usage.model;
+  const inTok = usage.input_tokens.toLocaleString();
+  const outTok = usage.output_tokens.toLocaleString();
+  const cost  = usage.cost_usd < 0.0001
+    ? '< $0.0001'
+    : '$' + usage.cost_usd.toFixed(4);
+  const el = document.createElement('div');
+  el.className = 'msg-usage';
+  el.textContent = `${name} · ${inTok} in + ${outTok} out tokens · ${cost}`;
+  return el;
+}
+
+function finalizeMsgWithCitations(msgEl, citations, suggestions, usage) {
   msgEl.querySelector('.typing-cursor')?.remove();
 
   // Convert inline [N] markers to superscript links
@@ -190,6 +211,9 @@ function finalizeMsgWithCitations(msgEl, citations, suggestions) {
 
   const suggRow = renderSuggestions(suggestions);
   if (suggRow) msgEl.appendChild(suggRow);
+
+  const usageEl = renderUsage(usage);
+  if (usageEl) msgEl.appendChild(usageEl);
 }
 
 // ── Conversation sidebar ──────────────────────────────────────────────────────
@@ -393,7 +417,7 @@ async function ask() {
         if (payload.done) {
           currentConversationId = payload.conversation_id;
           chatToolbar.classList.add('visible');
-          finalizeMsgWithCitations(msgEl, payload.citations || [], payload.suggestions || []);
+          finalizeMsgWithCitations(msgEl, payload.citations || [], payload.suggestions || [], payload.usage || null);
           Progress.done();
           clearSteps();
 

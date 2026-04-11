@@ -43,7 +43,7 @@ class TestCosineSimilarity:
     def test_zero_vector_returns_zero(self):
         a = np.array([0.0, 0.0])
         b = np.array([1.0, 0.0])
-        assert _app.cosine_similarity(a, b) == 0.0
+        assert _app.cosine_similarity(a, b) == pytest.approx(0.0)
 
     def test_general_case(self):
         a = np.array([1.0, 1.0])
@@ -265,14 +265,14 @@ class TestAdvanceDelimiterState:
         return _app._sse_emit(payload)
 
     def test_accumulates_pre_delimiter_text(self):
-        pre, post, found, events = _app._advance_delimiter_state(
+        pre, _, found, events = _app._advance_delimiter_state(
             "", "", False, "hello", self.DELIM, self._emit
         )
         assert not found
         assert pre == "hello" or events  # safe_len may flush partial
 
     def test_detects_delimiter(self):
-        pre, post, found, events = _app._advance_delimiter_state(
+        _, post, found, events = _app._advance_delimiter_state(
             "answer", "", False, self.DELIM + "suggestions", self.DELIM, self._emit
         )
         assert found
@@ -281,7 +281,7 @@ class TestAdvanceDelimiterState:
         assert any("answer" in e for e in events)
 
     def test_after_delimiter_appends_to_post(self):
-        pre, post, found, events = _app._advance_delimiter_state(
+        _, post, found, events = _app._advance_delimiter_state(
             "", "part1", True, " part2", self.DELIM, self._emit
         )
         assert found
@@ -292,7 +292,7 @@ class TestAdvanceDelimiterState:
         # When text doesn't contain delimiter, chars outside the delimiter
         # window should be emitted as safe
         long_text = "x" * 100
-        pre, post, found, events = _app._advance_delimiter_state(
+        pre, _, _, events = _app._advance_delimiter_state(
             "", "", False, long_text, self.DELIM, self._emit
         )
         # Some safe text should have been emitted
@@ -341,9 +341,6 @@ class TestBuildRagContext:
         assert "[3]" in context
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# _extract_answer_from_events
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class TestExtractAnswerFromEvents:
     def test_basic_extraction(self):

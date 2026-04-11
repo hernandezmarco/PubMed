@@ -5,6 +5,7 @@ import logging.handlers
 import os
 import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import anthropic
@@ -397,8 +398,31 @@ def collections_save():
         pmids = [a["pmid"] for a in articles]
         pmcid_map = get_pmcids(pmids)
         cid = db.create_collection(name, user_query, pubmed_query)
-        for art in articles:
-            _store_article(cid, art, pmcid_map)
+
+        # Phase 1: fetch PMC full texts in parallel (I/O-bound network calls)
+        max_workers = min(len(articles), 8)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            fetched = list(executor.map(_fetch_article_text, articles, [pmcid_map] * len(articles)))
+
+        # Phase 2: persist article rows; collect chunks that still need embedding
+        pending: list[tuple[str, list[str]]] = []  # [(pmid, chunks), ...]
+        for art, full_text, pmcid in fetched:
+            db.add_article(cid, art, has_full_text=bool(full_text), pmcid=pmcid)
+            pmid = art["pmid"]
+            if not db.chunks_exist(pmid):
+                text_to_chunk = full_text or f"{art['title']}. {art['abstract']}"
+                pending.append((pmid, chunk_text(text_to_chunk, cfg.CHUNK_SIZE, cfg.CHUNK_OVERLAP)))
+
+        # Phase 3: embed all pending chunks in one batch, then save
+        if pending:
+            all_chunks = [c for _, chunks in pending for c in chunks]
+            all_embeddings = embed_texts(all_chunks)
+            offset = 0
+            for pmid, chunks in pending:
+                n = len(chunks)
+                db.save_chunks(pmid, chunks, all_embeddings[offset:offset + n])
+                offset += n
+
         return {"id": cid}
     except Exception as exc:
         return {"error": str(exc)}, 500
@@ -412,15 +436,17 @@ def _try_fetch_full_text(pmcid: str) -> tuple[str | None, str | None]:
         return None, None
 
 
-def _store_article(cid: int, art: dict, pmcid_map: dict):
-    pmid = art["pmid"]
-    pmcid = pmcid_map.get(pmid)
-    full_text, pmcid = _try_fetch_full_text(pmcid) if pmcid else (None, None)
-    db.add_article(cid, art, has_full_text=bool(full_text), pmcid=pmcid)
-    if not db.chunks_exist(pmid):
-        text_to_chunk = full_text or f"{art['title']}. {art['abstract']}"
-        chunks = chunk_text(text_to_chunk, cfg.CHUNK_SIZE, cfg.CHUNK_OVERLAP)
-        db.save_chunks(pmid, chunks, embed_texts(chunks))
+def _fetch_article_text(art: dict, pmcid_map: dict) -> tuple[dict, str | None, str | None]:
+    """Resolve PMC full text for one article (called in parallel).
+
+    Returns (art, full_text, resolved_pmcid).
+    """
+    pmcid = pmcid_map.get(art["pmid"])
+    if pmcid:
+        full_text, resolved_pmcid = _try_fetch_full_text(pmcid)
+    else:
+        full_text, resolved_pmcid = None, None
+    return art, full_text, resolved_pmcid
 
 
 def generate_starter_questions(user_query: str, articles: list[dict]) -> list[str]:
@@ -594,7 +620,7 @@ def collection_ask(cid: int):
         return {"error": "No question provided."}, 400
     model = data.get("model", cfg.DEFAULT_CHAT_MODEL)
     if model not in cfg.ALLOWED_CHAT_MODELS:
-        model = DEFAULT_MODEL
+        model = cfg.DEFAULT_CHAT_MODEL
     conversation_id = data.get("conversation_id")
 
     q_emb = embed_texts([question])[0]

@@ -160,17 +160,18 @@ def chunks_exist(pmid: str) -> bool:
 
 def save_chunks(pmid: str, chunks: list[str], embeddings: list[np.ndarray]):
     t0 = time.perf_counter()
+    data = [(pmid, i, text, emb) for i, (text, emb) in enumerate(zip(chunks, embeddings))]
     with db_conn() as conn:
         cur = conn.cursor()
-        for i, (text, emb) in enumerate(zip(chunks, embeddings)):
-            cur.execute(
-                """
-                INSERT INTO article_chunks (pmid, chunk_index, text, embedding)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (pmid, chunk_index) DO NOTHING
-                """,
-                (pmid, i, text, emb),
-            )
+        psycopg2.extras.execute_values(
+            cur,
+            """
+            INSERT INTO article_chunks (pmid, chunk_index, text, embedding)
+            VALUES %s
+            ON CONFLICT (pmid, chunk_index) DO NOTHING
+            """,
+            data,
+        )
     _log.info("op=save_chunks pmid=%s chunks=%d duration=%.3fs", pmid, len(chunks), time.perf_counter() - t0)
 
 

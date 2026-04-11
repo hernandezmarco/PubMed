@@ -151,9 +151,10 @@ Flask (app.py)
   │     └── fastembed               ──►  Cosine similarity ranking
   │
   ├── POST /collections                  Save selected articles
-  │     ├── NCBI elink/efetch       ──►  PMC full text (where available)
+  │     ├── NCBI elink/efetch       ──►  PMC full text (parallel, up to 8 workers)
   │     ├── chunk_text()            ──►  1 000-char chunks, 200-char overlap
-  │     └── fastembed + pgvector    ──►  Store embeddings
+  │     ├── fastembed               ──►  Batch-embed all chunks in one call
+  │     └── pgvector                ──►  Batch-insert embeddings (execute_values)
   │
   ├── POST /collections/<id>/ask         Chat with a collection (SSE)
   │     ├── fastembed               ──►  Embed question

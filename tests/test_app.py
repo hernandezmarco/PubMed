@@ -412,18 +412,48 @@ class TestCollectionsRoute:
         mock_list.assert_called_once()
 
 
+class TestFetchArticleText:
+    _ART = {"pmid": "123", "title": "T", "authors": "A",
+            "journal": "J", "year": "2024", "abstract": "AB",
+            "url": "https://pubmed.ncbi.nlm.nih.gov/123/"}
+
+    def test_no_pmcid_returns_none(self):
+        art, full_text, pmcid = _app._fetch_article_text(self._ART, {})
+        assert art is self._ART
+        assert full_text is None
+        assert pmcid is None
+
+    @patch("app._try_fetch_full_text", return_value=("Full text body", "PMC999"))
+    def test_with_pmcid_calls_fetch(self, mock_fetch):
+        _, full_text, pmcid = _app._fetch_article_text(self._ART, {"123": "PMC999"})
+        mock_fetch.assert_called_once_with("PMC999")
+        assert full_text == "Full text body"
+        assert pmcid == "PMC999"
+
+    @patch("app._try_fetch_full_text", return_value=(None, None))
+    def test_fetch_failure_returns_none(self, mock_fetch):
+        _, full_text, pmcid = _app._fetch_article_text(self._ART, {"123": "PMC999"})
+        assert full_text is None
+        assert pmcid is None
+
+
 class TestCollectionsSaveRoute:
+    _ART = {"pmid": "123", "title": "T", "authors": "A",
+            "journal": "J", "year": "2024", "abstract": "AB",
+            "url": "https://pubmed.ncbi.nlm.nih.gov/123/"}
+
     @patch("app.get_pmcids", return_value={})
     @patch("app.db.create_collection", return_value=42)
-    @patch("app._store_article")
-    def test_save_success(self, mock_store, mock_create, mock_pmcids, client):
+    @patch("app.db.add_article")
+    @patch("app.db.chunks_exist", return_value=True)  # skip embedding phase
+    @patch("app._fetch_article_text")
+    def test_save_success(self, mock_fetch, mock_exist, mock_add, mock_create, mock_pmcids, client):
+        mock_fetch.return_value = (self._ART, None, None)
         payload = {
             "name": "My Collection",
             "user_query": "diabetes",
             "pubmed_query": "diabetes[MeSH]",
-            "articles": [{"pmid": "123", "title": "T", "authors": "A",
-                          "journal": "J", "year": "2024", "abstract": "AB",
-                          "url": "http://example.com"}],
+            "articles": [self._ART],
         }
         resp = client.post("/collections", json=payload)
         assert resp.status_code == 200
@@ -437,6 +467,35 @@ class TestCollectionsSaveRoute:
     def test_save_missing_articles_returns_400(self, client):
         resp = client.post("/collections", json={"name": "Test", "articles": []})
         assert resp.status_code == 400
+
+    @patch("app.db.save_chunks")
+    @patch("app.embed_texts")
+    @patch("app.db.chunks_exist", return_value=False)
+    @patch("app.db.add_article")
+    @patch("app.db.create_collection", return_value=1)
+    @patch("app.get_pmcids", return_value={})
+    @patch("app._fetch_article_text")
+    def test_embed_called_once_for_multiple_articles(
+        self, mock_fetch, mock_pmcids, mock_create, mock_add, mock_exist,
+        mock_embed, mock_save, client
+    ):
+        """All chunks across all articles are embedded in a single batch call."""
+        art1 = {**self._ART, "pmid": "111", "abstract": "Abstract one."}
+        art2 = {**self._ART, "pmid": "222", "abstract": "Abstract two."}
+        mock_fetch.side_effect = [(art1, None, None), (art2, None, None)]
+        mock_embed.return_value = [np.zeros(384)] * 100  # oversized; index slicing handles it
+
+        client.post("/collections", json={
+            "name": "Batch Test",
+            "user_query": "q",
+            "pubmed_query": "q[MeSH]",
+            "articles": [art1, art2],
+        })
+
+        # embed_texts must be called exactly once, not once per article
+        mock_embed.assert_called_once()
+        # save_chunks called once per article
+        assert mock_save.call_count == 2
 
 
 class TestCollectionDetailRoute:
@@ -607,8 +666,6 @@ class TestBuildRtf:
         rtf.encode("ascii")  # must not raise
 
 class TestBuildDocx:
-    import io as _io
-
     _MSGS = [
         {"role": "user",      "content": "What is the treatment?"},
         {"role": "assistant", "content": "It involves X.\nAnd also Y."},

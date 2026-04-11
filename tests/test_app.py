@@ -19,6 +19,7 @@ fastembed_stub.TextEmbedding = MagicMock()
 sys.modules.setdefault("fastembed", fastembed_stub)
 
 import app as _app  # noqa: E402  (must come after stubs)
+import config as cfg
 
 
 class TestCosineSimilarity:
@@ -51,59 +52,61 @@ class TestCosineSimilarity:
 class TestChunkText:
     def test_short_text_single_chunk(self):
         text = "Hello world"
-        chunks = _app.chunk_text(text, chunk_size=1000, overlap=200)
+        chunks = _app.chunk_text(text, chunk_size=cfg.CHUNK_SIZE, overlap=cfg.CHUNK_OVERLAP)
         assert chunks == ["Hello world"]
 
     def test_exact_chunk_size(self):
-        text = "a" * 1000
-        chunks = _app.chunk_text(text, chunk_size=1000, overlap=200)
+        text = "a" * cfg.CHUNK_SIZE
+        chunks = _app.chunk_text(text, chunk_size=cfg.CHUNK_SIZE, overlap=cfg.CHUNK_OVERLAP)
         assert len(chunks) == 1
-        assert chunks[0] == "a" * 1000
+        assert chunks[0] == "a" * cfg.CHUNK_SIZE
 
     def test_two_chunks_with_overlap(self):
-        text = "a" * 1200
-        chunks = _app.chunk_text(text, chunk_size=1000, overlap=200)
+        text = "a" * (cfg.CHUNK_SIZE + cfg.CHUNK_OVERLAP)
+        chunks = _app.chunk_text(text, chunk_size=cfg.CHUNK_SIZE, overlap=cfg.CHUNK_OVERLAP)
         assert len(chunks) == 2
-        # Second chunk starts at offset 800, so it has 400 chars
-        assert len(chunks[1]) == 400
+        # Second chunk starts at offset (CHUNK_SIZE - CHUNK_OVERLAP)
+        assert len(chunks[1]) == cfg.CHUNK_OVERLAP * 2
 
     def test_empty_text_returns_no_chunks(self):
-        assert _app.chunk_text("", chunk_size=1000, overlap=200) == []
+        assert _app.chunk_text("", chunk_size=cfg.CHUNK_SIZE, overlap=cfg.CHUNK_OVERLAP) == []
 
     def test_whitespace_only_not_included(self):
-        text = "   " + "a" * 1000 + "   "
-        chunks = _app.chunk_text(text, chunk_size=1000, overlap=200)
+        text = "   " + "a" * cfg.CHUNK_SIZE + "   "
+        chunks = _app.chunk_text(text, chunk_size=cfg.CHUNK_SIZE, overlap=cfg.CHUNK_OVERLAP)
         # Strip means leading/trailing whitespace removed from each chunk
         for c in chunks:
             assert c == c.strip()
 
     def test_multiple_chunks_cover_all_content(self):
-        text = "x" * 2600
-        chunks = _app.chunk_text(text, chunk_size=1000, overlap=200)
-        # Starts: 0 (end=1000), 800 (end=1800), 1600 (end=2600 == len → break) → 3 chunks
+        # step = CHUNK_SIZE - CHUNK_OVERLAP; 3 steps fit in 2*CHUNK_SIZE + step
+        step = cfg.CHUNK_SIZE - cfg.CHUNK_OVERLAP
+        text = "x" * (cfg.CHUNK_SIZE + 2 * step)
+        chunks = _app.chunk_text(text, chunk_size=cfg.CHUNK_SIZE, overlap=cfg.CHUNK_OVERLAP)
         assert len(chunks) == 3
 
 class TestClampMaxResults:
     def test_default_empty_string(self):
-        assert _app._clamp_max_results("") == 25
+        assert _app._clamp_max_results("") == cfg.MAX_RESULTS_DEFAULT
 
-    def test_below_minimum_clamped_to_25(self):
-        assert _app._clamp_max_results("10") == 25
+    def test_below_minimum_clamped_to_min(self):
+        assert _app._clamp_max_results("10") == cfg.MAX_RESULTS_MIN
 
     def test_exact_minimum(self):
-        assert _app._clamp_max_results("25") == 25
+        assert _app._clamp_max_results(str(cfg.MAX_RESULTS_MIN)) == cfg.MAX_RESULTS_MIN
 
-    def test_above_maximum_clamped_to_200(self):
-        assert _app._clamp_max_results("999") == 200
+    def test_above_maximum_clamped_to_max(self):
+        assert _app._clamp_max_results("999") == cfg.MAX_RESULTS_MAX
 
     def test_exact_maximum(self):
-        assert _app._clamp_max_results("200") == 200
+        assert _app._clamp_max_results(str(cfg.MAX_RESULTS_MAX)) == cfg.MAX_RESULTS_MAX
 
-    def test_rounds_down_to_multiple_of_25(self):
-        assert _app._clamp_max_results("60") == 50
+    def test_rounds_down_to_multiple_of_step(self):
+        # 60 is between 2× and 3× the step size; should round down to 2×
+        assert _app._clamp_max_results("60") == cfg.MAX_RESULTS_MIN * 2
 
-    def test_multiple_of_25_unchanged(self):
-        assert _app._clamp_max_results("75") == 75
+    def test_exact_multiple_of_step_unchanged(self):
+        assert _app._clamp_max_results("75") == cfg.MAX_RESULTS_MIN * 3
 
 def _make_article_xml(authors_xml: str, abstract_xml: str = "", extra: str = "") -> ET.Element:
     xml = f"""
@@ -147,15 +150,15 @@ class TestParseAuthors:
         node = _make_article_xml(authors_xml)
         assert _app._parse_authors(node) == "Smith JA, Jones B"
 
-    def test_more_than_six_authors_truncated(self):
+    def test_more_than_max_authors_truncated(self):
         authors_xml = "".join(
             f"<Author><LastName>Author{i}</LastName><Initials>X</Initials></Author>"
-            for i in range(8)
+            for i in range(cfg.AUTHORS_DISPLAY_MAX + 2)
         )
         node = _make_article_xml(authors_xml)
         result = _app._parse_authors(node)
         assert result.endswith("et al.")
-        assert result.count(",") == 5  # 6 names = 5 commas
+        assert result.count(",") == cfg.AUTHORS_DISPLAY_MAX - 1
 
     def test_no_authors_returns_unknown(self):
         node = _make_article_xml("")
@@ -227,7 +230,7 @@ class TestParseSuggestions:
 
 
 class TestAdvanceDelimiterState:
-    DELIM = "\n===\n"
+    DELIM = cfg.RAG_DELIMITER
 
     def _emit(self, payload):
         return _app._sse_emit(payload)
@@ -444,9 +447,9 @@ class TestCollectionAskRoute:
     def test_invalid_model_falls_back_to_default(self, client):
         # Just verify the model validation logic directly
         model = "invalid-model"
-        if model not in _app.ALLOWED_MODELS:
-            model = _app.DEFAULT_MODEL
-        assert model == _app.DEFAULT_MODEL
+        if model not in cfg.ALLOWED_CHAT_MODELS:
+            model = cfg.DEFAULT_CHAT_MODEL
+        assert model == cfg.DEFAULT_CHAT_MODEL
 
 
 class TestCollectionDeleteRoute:

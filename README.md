@@ -14,7 +14,7 @@ Searching PubMed manually requires knowing MeSH terms, Boolean operators, and fi
 3. **NCBI returns up to 200 articles**; each abstract is embedded and ranked by cosine similarity to your original question.
 4. **You review and select** the most relevant articles, set a relevance threshold with a slider, and save them as a named collection.
 5. **The collection becomes a knowledge base** — full-text PMC articles are fetched where available, chunked, embedded, and stored in pgvector.
-6. **Chat with your collection** — ask follow-up questions and get cited, streamed answers grounded in the papers you saved. Claude suggests four follow-up questions after every answer.
+6. **Chat with your collection** — ask follow-up questions and get cited, streamed answers grounded in the papers you saved. Inline citation markers like `[1]` are rendered as clickable superscript links that open the source article directly. Claude suggests four follow-up questions after every answer.
 7. **Conversations are saved** — every chat thread is persisted to the database. A sidebar lists past conversations by title and date; click any entry to pick up where you left off, or start a fresh thread with the **+** button.
 8. **Export a conversation** — click **Save ▾** in the chat toolbar to download the current conversation as a Word (`.docx`) or RTF (`.rtf`) file, including the question/answer history and metadata.
 
@@ -173,7 +173,8 @@ Database (PostgreSQL + pgvector)
   ├── article_chunks         — id, pmid, chunk_index, text, embedding vector(384)
   │                            UNIQUE(pmid, chunk_index) · HNSW index on embedding
   ├── conversations          — id, collection_id, title (first question), created_at
-  └── conversation_messages  — id, conversation_id, role (user|assistant), content, created_at
+  └── conversation_messages  — id, conversation_id, role (user|assistant), content,
+                               citations JSONB (num/pmid/title/url per cited article), created_at
 ```
 
 ### Embedding model

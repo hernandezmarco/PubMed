@@ -293,6 +293,9 @@ header .meta { font-size: .82rem; opacity: .7; margin-top: .3rem; }
 }
 .suggestion-chip:hover { background: #dceeff; border-color: #0f3460; }
 
+.cite-link { color: #0f3460; text-decoration: none; font-weight: 700; }
+.cite-link:hover { text-decoration: underline; }
+
 .typing-cursor {
   display: inline-block;
   width: 2px; height: 1em;

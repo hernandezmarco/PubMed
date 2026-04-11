@@ -294,12 +294,24 @@ class TestBuildRagContext:
             self._make_chunk("222", chunk_text="Chunk 3"),
         ]
         context, citations = _app._build_rag_context(chunks)
-        # Context has all 3 numbered entries
-        assert "[1]" in context and "[2]" in context and "[3]" in context
+        # Both chunks from PMID 111 share [1]; PMID 222 gets [2]
+        assert context.count("[1]") == 2
+        assert "[2]" in context
+        assert "[3]" not in context
         # Citations deduplicated: only 2 unique PMIDs
         assert len(citations) == 2
         pmids = [c["pmid"] for c in citations]
         assert pmids == ["111", "222"]
+
+    def test_duplicate_pmid_shares_citation_number(self):
+        chunks = [
+            self._make_chunk("111", chunk_text="Chunk A"),
+            self._make_chunk("111", chunk_text="Chunk B"),
+        ]
+        context, citations = _app._build_rag_context(chunks)
+        assert context.count("[1]") == 2
+        assert "[2]" not in context
+        assert len(citations) == 1
 
     def test_numbering_increments(self):
         chunks = [self._make_chunk(str(i)) for i in range(3)]
@@ -307,6 +319,30 @@ class TestBuildRagContext:
         assert "[1]" in context
         assert "[2]" in context
         assert "[3]" in context
+
+    def test_citations_ordered_by_first_appearance(self):
+        # Citation list should reflect the order chunks are first seen, not PMID sort order
+        chunks = [
+            self._make_chunk("333", chunk_text="First"),
+            self._make_chunk("111", chunk_text="Second"),
+            self._make_chunk("222", chunk_text="Third"),
+        ]
+        _, citations = _app._build_rag_context(chunks)
+        assert [c["pmid"] for c in citations] == ["333", "111", "222"]
+
+    def test_context_uses_article_number_not_chunk_index(self):
+        # When chunks 1+2 share a PMID, neither [3] nor [2]-for-second-article
+        # should appear for the second chunk — the article number is reused.
+        chunks = [
+            self._make_chunk("A", chunk_text="chunkA1"),
+            self._make_chunk("A", chunk_text="chunkA2"),
+            self._make_chunk("B", chunk_text="chunkB"),
+        ]
+        context, _ = _app._build_rag_context(chunks)
+        # Article A = [1], article B = [2]; chunk index [3] must not appear
+        assert "[3]" not in context
+        assert context.count("[1]") == 2
+        assert context.count("[2]") == 1
 
 
 
@@ -473,6 +509,34 @@ class TestConversationRoutes:
         resp = client.get("/conversations/3/messages")
         assert resp.status_code == 200
         mock_get.assert_called_once_with(3)
+
+    @patch("app.db.get_conversation_messages", return_value=[
+        {"role": "user",      "content": "Q?",  "citations": None,
+         "created_at": "2024-01-01T00:00:00"},
+        {"role": "assistant", "content": "A.",
+         "citations": [{"num": 1, "pmid": "111", "url": "https://pubmed.ncbi.nlm.nih.gov/111/",
+                        "title": "T", "journal": "J", "year": "2024", "similarity": 0.9}],
+         "created_at": "2024-01-01T00:00:01"},
+    ])
+    def test_get_messages_citations_field_returned(self, mock_get, client):
+        resp = client.get("/conversations/3/messages")
+        data = resp.get_json()
+        assert data[0]["citations"] is None
+        assert data[1]["citations"][0]["num"] == 1
+        assert data[1]["citations"][0]["url"].startswith("https://")
+
+    @patch("app.db.get_conversation_messages", return_value=[
+        {"role": "assistant", "content": "A.",
+         "citations": [
+             {"num": 1, "pmid": "A", "url": "https://u1", "title": "T1", "journal": "J", "year": "2024", "similarity": 0.9},
+             {"num": 2, "pmid": "B", "url": "https://u2", "title": "T2", "journal": "J", "year": "2024", "similarity": 0.8},
+         ],
+         "created_at": "2024-01-01T00:00:00"},
+    ])
+    def test_get_messages_citation_num_sequential(self, mock_get, client):
+        data = resp = client.get("/conversations/3/messages").get_json()
+        nums = [c["num"] for c in data[0]["citations"]]
+        assert nums == [1, 2]
 
     @patch("app.db.delete_conversation")
     def test_delete_conversation(self, mock_delete, client):

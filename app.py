@@ -530,20 +530,27 @@ def _advance_delimiter_state(
 
 
 def _build_rag_context(top_chunks: list[dict]) -> tuple[str, list[dict]]:
-    """Return (context_string, deduplicated_citations)."""
+    """Return (context_string, deduplicated_citations).
+
+    Each unique article is assigned one citation number. Chunks from the same
+    article share that number so Claude's inline [N] markers always match the
+    numbers shown in the Sources section.
+    """
     context_parts = []
-    seen_pmids: set[str] = set()
+    pmid_to_num: dict[str, int] = {}
     citations = []
-    for i, chunk in enumerate(top_chunks, 1):
+    for chunk in top_chunks:
+        pmid = chunk["pmid"]
+        if pmid not in pmid_to_num:
+            pmid_to_num[pmid] = len(citations) + 1
+            citations.append(chunk)
+        num = pmid_to_num[pmid]
         context_parts.append(
-            f"[{i}] {chunk['title']}\n"
+            f"[{num}] {chunk['title']}\n"
             f"Authors: {chunk['authors']}\n"
             f"Journal: {chunk['journal']} ({chunk['year']})\n"
             f"Excerpt: {chunk['chunk_text']}"
         )
-        if chunk["pmid"] not in seen_pmids:
-            seen_pmids.add(chunk["pmid"])
-            citations.append(chunk)
     return "\n\n".join(context_parts), citations
 
 
@@ -613,6 +620,20 @@ def collection_ask(cid: int):
 
     context, citations = _build_rag_context(top_chunks)
 
+    # Slim, serialisable form — num field lets the frontend map [N] → URL
+    stored_citations = [
+        {
+            "num": i + 1,
+            "pmid": c["pmid"],
+            "title": c["title"],
+            "url": c["url"],
+            "journal": c["journal"],
+            "year": c["year"],
+            "similarity": c["similarity"],
+        }
+        for i, c in enumerate(citations)
+    ]
+
     _DELIM = cfg.RAG_DELIMITER
 
     def generate():
@@ -627,15 +648,15 @@ def collection_ask(cid: int):
         yield from answer_text
 
         full_answer = _extract_answer_from_events(answer_text)
-        db.add_message(conversation_id, "assistant", full_answer)
+        db.add_message(conversation_id, "assistant", full_answer, stored_citations)
 
         suggestions = _parse_suggestions(suggestions_json)
         elapsed = time.perf_counter() - t0
         _claude_log.info(
             "op=collection_ask cid=%d vid=%d citations=%d suggestions=%d duration=%.2fs",
-            cid, conversation_id, len(citations), len(suggestions), elapsed,
+            cid, conversation_id, len(stored_citations), len(suggestions), elapsed,
         )
-        yield f"data: {json.dumps({'done': True, 'citations': citations, 'suggestions': suggestions, 'conversation_id': conversation_id})}\n\n"
+        yield f"data: {json.dumps({'done': True, 'citations': stored_citations, 'suggestions': suggestions, 'conversation_id': conversation_id})}\n\n"
 
     return Response(
         stream_with_context(generate()),

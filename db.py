@@ -103,9 +103,13 @@ def init_db():
                 conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
                 role            TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
                 content         TEXT NOT NULL,
+                citations       JSONB,
                 created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
+        cur.execute(
+            "ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS citations JSONB"
+        )
 
 
 # ── Write helpers ──────────────────────────────────────────────────────────────
@@ -282,12 +286,13 @@ def create_conversation(cid: int, title: str) -> int:
     return vid
 
 
-def add_message(vid: int, role: str, content: str):
+def add_message(vid: int, role: str, content: str, citations: list | None = None):
     t0 = time.perf_counter()
     with db_conn() as conn:
         conn.cursor().execute(
-            "INSERT INTO conversation_messages (conversation_id, role, content) VALUES (%s, %s, %s)",
-            (vid, role, content),
+            "INSERT INTO conversation_messages (conversation_id, role, content, citations) "
+            "VALUES (%s, %s, %s, %s)",
+            (vid, role, content, psycopg2.extras.Json(citations) if citations is not None else None),
         )
     _log.debug("op=add_message vid=%d role=%s duration=%.3fs", vid, role, time.perf_counter() - t0)
 
@@ -338,7 +343,7 @@ def get_conversation_messages(vid: int) -> list[dict]:
     with db_conn() as conn:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute(
-            "SELECT id, role, content, created_at::text AS created_at "
+            "SELECT id, role, content, citations, created_at::text AS created_at "
             "FROM conversation_messages WHERE conversation_id = %s ORDER BY id",
             (vid,),
         )

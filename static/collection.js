@@ -88,6 +88,42 @@ function clearSteps() {
   Object.values(stepEls).forEach(el => el.classList.remove('active', 'done'));
 }
 
+// ── Citation linking ──────────────────────────────────────────────────────────
+function linkifyCitations(el, citations) {
+  if (!citations || !citations.length) return;
+  const urlMap = {};
+  citations.forEach((c, i) => { urlMap[c.num !== undefined ? c.num : i + 1] = c.url; });
+
+  // Walk text nodes so we never corrupt HTML attribute values or tag names
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  const nodes = [];
+  let node;
+  while ((node = walker.nextNode())) {
+    if (/\[\d+\]/.test(node.textContent)) nodes.push(node);
+  }
+  nodes.forEach(textNode => {
+    const frag = document.createDocumentFragment();
+    textNode.textContent.split(/(\[\d+\])/).forEach(part => {
+      const m = part.match(/^\[(\d+)\]$/);
+      const url = m && urlMap[parseInt(m[1])];
+      if (url) {
+        const sup = document.createElement('sup');
+        const a   = document.createElement('a');
+        a.href      = url;
+        a.target    = '_blank';
+        a.rel       = 'noopener';
+        a.className = 'cite-link';
+        a.textContent = part;
+        sup.appendChild(a);
+        frag.appendChild(sup);
+      } else {
+        frag.appendChild(document.createTextNode(part));
+      }
+    });
+    textNode.parentNode.replaceChild(frag, textNode);
+  });
+}
+
 // ── Message rendering ─────────────────────────────────────────────────────────
 function appendUserMsg(text) {
   document.getElementById('empty-hint')?.remove();
@@ -127,16 +163,21 @@ function renderSuggestions(questions) {
 function finalizeMsgWithCitations(msgEl, citations, suggestions) {
   msgEl.querySelector('.typing-cursor')?.remove();
 
+  // Convert inline [N] markers to superscript links
+  const answerEl = msgEl.querySelector('.answer');
+  if (answerEl && citations.length) linkifyCitations(answerEl, citations);
+
   if (citations.length) {
     const citDiv = document.createElement('div');
     citDiv.className = 'citations';
     citDiv.innerHTML = '<div class="citations-label">Sources retrieved</div>';
 
     citations.forEach((art, i) => {
+      const num  = art.num !== undefined ? art.num : i + 1;
       const item = document.createElement('div');
       item.className = 'citation-item';
       item.innerHTML =
-        `<span class="citation-num">[${i + 1}]</span>` +
+        `<span class="citation-num">[${num}]</span>` +
         `<span><a href="${art.url}" target="_blank" rel="noopener">${escapeHtml(art.title)}</a>` +
         ` <em style="color:#888;font-size:.75rem">${escapeHtml(art.journal)}${art.year ? ' ' + art.year : ''}</em>` +
         `<span class="sim-badge">${(art.similarity * 100).toFixed(0)}% match</span></span>`;
@@ -236,6 +277,9 @@ async function loadConversation(vid) {
         const ansEl = document.createElement('span');
         ansEl.className = 'answer';
         ansEl.innerHTML = marked.parse(msg.content);
+        if (msg.citations && msg.citations.length) {
+          linkifyCitations(ansEl, msg.citations);
+        }
         el.appendChild(ansEl);
         chatMessages.appendChild(el);
       }

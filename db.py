@@ -313,6 +313,26 @@ def list_conversations(cid: int) -> list[dict]:
     return rows
 
 
+def get_conversation(vid: int) -> dict | None:
+    t0 = time.perf_counter()
+    with db_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            """
+            SELECT v.id, v.title, v.created_at::text AS created_at,
+                   c.name AS collection_name
+            FROM conversations v
+            JOIN rag_collections c ON c.id = v.collection_id
+            WHERE v.id = %s
+            """,
+            (vid,),
+        )
+        row = cur.fetchone()
+    result = dict(row) if row else None
+    _log.info("op=get_conversation vid=%d found=%s duration=%.3fs", vid, result is not None, time.perf_counter() - t0)
+    return result
+
+
 def get_conversation_messages(vid: int) -> list[dict]:
     t0 = time.perf_counter()
     with db_conn() as conn:

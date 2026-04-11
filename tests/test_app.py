@@ -480,3 +480,169 @@ class TestConversationRoutes:
         assert resp.status_code == 200
         assert resp.get_json() == {"ok": True}
         mock_delete.assert_called_once_with(3)
+
+
+class TestRtfEsc:
+    def test_plain_ascii_unchanged(self):
+        assert _app._rtf_esc("hello world") == "hello world"
+
+    def test_backslash_escaped(self):
+        assert _app._rtf_esc("a\\b") == "a\\\\b"
+
+    def test_open_brace_escaped(self):
+        assert _app._rtf_esc("a{b") == "a\\{b"
+
+    def test_close_brace_escaped(self):
+        assert _app._rtf_esc("a}b") == "a\\}b"
+
+    def test_non_ascii_unicode_escaped(self):
+        # é = U+00E9 = decimal 233
+        result = _app._rtf_esc("caf\u00e9")
+        assert "\\u233?" in result
+
+    def test_empty_string(self):
+        assert _app._rtf_esc("") == ""
+
+
+class TestBuildRtf:
+    _MSGS = [
+        {"role": "user",      "content": "What is the treatment?"},
+        {"role": "assistant", "content": "It involves X.\nAnd also Y."},
+    ]
+
+    def test_starts_with_rtf_header(self):
+        rtf = _app._build_rtf("Title", "Col", "2024-01-01", self._MSGS)
+        assert rtf.startswith(r"{\rtf1")
+
+    def test_ends_with_closing_brace(self):
+        rtf = _app._build_rtf("Title", "Col", "2024-01-01", self._MSGS)
+        assert rtf.rstrip().endswith("}")
+
+    def test_contains_title(self):
+        rtf = _app._build_rtf("My Study", "Col", "2024-01-01", self._MSGS)
+        assert "My Study" in rtf
+
+    def test_contains_collection_name(self):
+        rtf = _app._build_rtf("Title", "Cardiology Collection", "2024-01-01", self._MSGS)
+        assert "Cardiology Collection" in rtf
+
+    def test_contains_date(self):
+        rtf = _app._build_rtf("Title", "Col", "2024-06-15T10:00:00", self._MSGS)
+        assert "2024-06-15" in rtf
+
+    def test_user_label_present(self):
+        rtf = _app._build_rtf("Title", "Col", "2024-01-01", self._MSGS)
+        assert "You:" in rtf
+
+    def test_assistant_label_present(self):
+        rtf = _app._build_rtf("Title", "Col", "2024-01-01", self._MSGS)
+        assert "Claude:" in rtf
+
+    def test_result_is_ascii_encodable(self):
+        rtf = _app._build_rtf("Title", "Col", "2024-01-01", self._MSGS)
+        rtf.encode("ascii")  # must not raise
+
+class TestBuildDocx:
+    import io as _io
+
+    _MSGS = [
+        {"role": "user",      "content": "What is the treatment?"},
+        {"role": "assistant", "content": "It involves X.\nAnd also Y."},
+    ]
+
+    def test_returns_bytes_io(self):
+        import io
+        result = _app._build_docx("Title", "Col", "2024-01-01", self._MSGS)
+        assert isinstance(result, io.BytesIO)
+
+    def test_content_is_zip_archive(self):
+        # DOCX files are ZIP archives — magic bytes are PK (0x50 0x4B)
+        result = _app._build_docx("Title", "Col", "2024-01-01", self._MSGS)
+        assert result.read(2) == b"PK"
+
+    def test_non_empty_output(self):
+        result = _app._build_docx("Title", "Col", "2024-01-01", self._MSGS)
+        assert result.getbuffer().nbytes > 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# conversation export route
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_EXPORT_CONV = {
+    "id": 1, "title": "Test Question",
+    "collection_name": "My Collection", "created_at": "2024-01-01T00:00:00",
+}
+_EXPORT_MSGS = [
+    {"role": "user",      "content": "What is the treatment?"},
+    {"role": "assistant", "content": "It involves X."},
+]
+
+
+class TestConversationExportRoute:
+    def test_invalid_format_returns_400(self, client):
+        resp = client.get("/conversations/1/export?format=pdf")
+        assert resp.status_code == 400
+
+    @patch("app.db.get_conversation", return_value=None)
+    def test_missing_conversation_returns_404(self, mock_conv, client):
+        resp = client.get("/conversations/999/export?format=docx")
+        assert resp.status_code == 404
+
+    @patch("app.db.get_conversation_messages", return_value=[])
+    @patch("app.db.get_conversation", return_value=_EXPORT_CONV)
+    def test_no_messages_returns_404(self, mock_conv, mock_msgs, client):
+        resp = client.get("/conversations/1/export?format=docx")
+        assert resp.status_code == 404
+
+    @patch("app.db.get_conversation_messages", return_value=_EXPORT_MSGS)
+    @patch("app.db.get_conversation", return_value=_EXPORT_CONV)
+    def test_docx_returns_200(self, mock_conv, mock_msgs, client):
+        resp = client.get("/conversations/1/export?format=docx")
+        assert resp.status_code == 200
+
+    @patch("app.db.get_conversation_messages", return_value=_EXPORT_MSGS)
+    @patch("app.db.get_conversation", return_value=_EXPORT_CONV)
+    def test_docx_content_type(self, mock_conv, mock_msgs, client):
+        resp = client.get("/conversations/1/export?format=docx")
+        assert "wordprocessingml" in resp.content_type
+
+    @patch("app.db.get_conversation_messages", return_value=_EXPORT_MSGS)
+    @patch("app.db.get_conversation", return_value=_EXPORT_CONV)
+    def test_docx_content_is_zip(self, mock_conv, mock_msgs, client):
+        resp = client.get("/conversations/1/export?format=docx")
+        assert resp.data[:2] == b"PK"
+
+    @patch("app.db.get_conversation_messages", return_value=_EXPORT_MSGS)
+    @patch("app.db.get_conversation", return_value=_EXPORT_CONV)
+    def test_rtf_returns_200(self, mock_conv, mock_msgs, client):
+        resp = client.get("/conversations/1/export?format=rtf")
+        assert resp.status_code == 200
+
+    @patch("app.db.get_conversation_messages", return_value=_EXPORT_MSGS)
+    @patch("app.db.get_conversation", return_value=_EXPORT_CONV)
+    def test_rtf_content_type(self, mock_conv, mock_msgs, client):
+        resp = client.get("/conversations/1/export?format=rtf")
+        assert resp.content_type == "application/rtf"
+
+    @patch("app.db.get_conversation_messages", return_value=_EXPORT_MSGS)
+    @patch("app.db.get_conversation", return_value=_EXPORT_CONV)
+    def test_rtf_body_starts_with_rtf_header(self, mock_conv, mock_msgs, client):
+        resp = client.get("/conversations/1/export?format=rtf")
+        assert resp.data.startswith(b"{\\rtf1")
+
+    @patch("app.db.get_conversation_messages", return_value=_EXPORT_MSGS)
+    @patch("app.db.get_conversation", return_value=_EXPORT_CONV)
+    def test_docx_content_disposition(self, mock_conv, mock_msgs, client):
+        resp = client.get("/conversations/1/export?format=docx")
+        cd = resp.headers.get("Content-Disposition", "")
+        assert "attachment" in cd
+        assert ".docx" in cd
+
+    @patch("app.db.get_conversation_messages", return_value=_EXPORT_MSGS)
+    @patch("app.db.get_conversation", return_value=_EXPORT_CONV)
+    def test_rtf_content_disposition(self, mock_conv, mock_msgs, client):
+        resp = client.get("/conversations/1/export?format=rtf")
+        cd = resp.headers.get("Content-Disposition", "")
+        assert "attachment" in cd
+        assert ".rtf" in cd

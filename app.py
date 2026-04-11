@@ -1,3 +1,4 @@
+import io
 import json
 import logging
 import logging.handlers
@@ -9,6 +10,8 @@ from pathlib import Path
 import anthropic
 import numpy as np
 import requests
+from docx import Document
+from docx.shared import RGBColor
 from flask import Flask, Response, render_template, request, stream_with_context
 from dotenv import load_dotenv
 
@@ -645,6 +648,118 @@ def collection_ask(cid: int):
 def collection_delete(cid: int):
     db.delete_collection(cid)
     return {"ok": True}
+
+
+# ── Conversation export ───────────────────────────────────────────────────────
+
+def _rtf_esc(text: str) -> str:
+    """Escape a string for inclusion in an RTF document body."""
+    out = []
+    for ch in text:
+        if ch == '\\':
+            out.append('\\\\')
+        elif ch == '{':
+            out.append('\\{')
+        elif ch == '}':
+            out.append('\\}')
+        elif ord(ch) > 127:
+            out.append(f'\\u{ord(ch)}?')
+        else:
+            out.append(ch)
+    return ''.join(out)
+
+
+def _build_rtf(title: str, collection_name: str, created_at: str, messages: list[dict]) -> str:
+    lines = [
+        r'{\rtf1\ansi\ansicpg1252\deff0',
+        r'{\fonttbl{\f0\fswiss\fcharset0 Arial;}}',
+        r'{\colortbl;\red15\green52\blue96;}',   # \cf1 = navy
+        r'\f0\fs20',
+        r'\pard\b\fs28 ' + _rtf_esc(title) + r'\b0\fs20\par',
+        r'\pard\i Collection: ' + _rtf_esc(collection_name) + r'\i0\par',
+        r'\pard\i Date: ' + _rtf_esc(created_at[:10]) + r'\i0\par',
+        r'\pard\par',
+    ]
+    for msg in messages:
+        if msg['role'] == 'user':
+            lines.append(r'\pard\cf1\b You:\b0\cf0 ' + _rtf_esc(msg['content']) + r'\par')
+        else:
+            lines.append(r'\pard\b Claude:\b0\par')
+            for line in msg['content'].split('\n'):
+                lines.append(r'\pard ' + _rtf_esc(line) + r'\par')
+        lines.append(r'\pard\par')
+    lines.append('}')
+    return '\n'.join(lines)
+
+
+def _build_docx(title: str, collection_name: str, created_at: str, messages: list[dict]) -> io.BytesIO:
+    doc = Document()
+    doc.add_heading(title, level=1)
+
+    meta = doc.add_paragraph()
+    meta.add_run(f'Collection: {collection_name}  |  {created_at[:10]}').italic = True
+
+    doc.add_paragraph()
+
+    for msg in messages:
+        if msg['role'] == 'user':
+            p = doc.add_paragraph()
+            label = p.add_run('You:  ')
+            label.bold = True
+            label.font.color.rgb = RGBColor(0x0F, 0x34, 0x60)
+            p.add_run(msg['content'])
+        else:
+            first = True
+            for line in msg['content'].split('\n'):
+                if first:
+                    p = doc.add_paragraph()
+                    label = p.add_run('Claude:  ')
+                    label.bold = True
+                    p.add_run(line)
+                    first = False
+                else:
+                    doc.add_paragraph(line)
+        doc.add_paragraph()
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf
+
+
+@app.route("/conversations/<int:vid>/export", methods=["GET"])
+def conversation_export(vid: int):
+    fmt = request.args.get("format", "docx").lower()
+    if fmt not in ("docx", "rtf"):
+        return {"error": "format must be 'docx' or 'rtf'"}, 400
+
+    conv = db.get_conversation(vid)
+    if not conv:
+        return "Conversation not found", 404
+
+    messages = db.get_conversation_messages(vid)
+    if not messages:
+        return "No messages to export", 404
+
+    safe_name = (
+        "".join(c for c in conv['title'] if c.isalnum() or c in ' -_')[:60].strip()
+        or "conversation"
+    )
+
+    if fmt == "docx":
+        buf = _build_docx(conv['title'], conv['collection_name'], conv['created_at'], messages)
+        return Response(
+            buf.read(),
+            mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={"Content-Disposition": f'attachment; filename="{safe_name}.docx"'},
+        )
+
+    rtf_text = _build_rtf(conv['title'], conv['collection_name'], conv['created_at'], messages)
+    return Response(
+        rtf_text.encode("ascii", errors="replace"),
+        mimetype="application/rtf",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}.rtf"'},
+    )
 
 
 # ── Startup ───────────────────────────────────────────────────────────────────

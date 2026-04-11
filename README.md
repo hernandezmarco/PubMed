@@ -16,6 +16,7 @@ Searching PubMed manually requires knowing MeSH terms, Boolean operators, and fi
 5. **The collection becomes a knowledge base** — full-text PMC articles are fetched where available, chunked, embedded, and stored in pgvector.
 6. **Chat with your collection** — ask follow-up questions and get cited, streamed answers grounded in the papers you saved. Claude suggests four follow-up questions after every answer.
 7. **Conversations are saved** — every chat thread is persisted to the database. A sidebar lists past conversations by title and date; click any entry to pick up where you left off, or start a fresh thread with the **+** button.
+8. **Export a conversation** — click **Save ▾** in the chat toolbar to download the current conversation as a Word (`.docx`) or RTF (`.rtf`) file, including the question/answer history and metadata.
 
 ---
 
@@ -160,9 +161,10 @@ Flask (app.py)
   │     ├── Claude (selectable)     ──►  Streamed cited answer + 4 follow-up suggestions
   │     └── db.add_message()        ──►  Persist user + assistant messages
   │
-  ├── GET /collections/<id>/conversations   List saved conversations
-  ├── GET /conversations/<id>/messages      Load a conversation's message history
-  └── POST /conversations/<id>/delete       Delete a conversation
+  ├── GET /collections/<id>/conversations        List saved conversations
+  ├── GET /conversations/<id>/messages           Load a conversation's message history
+  ├── POST /conversations/<id>/delete            Delete a conversation
+  └── GET /conversations/<id>/export?format=…   Download conversation as .docx or .rtf
 
 Database (PostgreSQL + pgvector)
   ├── rag_collections        — id, name, user_query, pubmed_query, created_at

@@ -1,11 +1,14 @@
 marked.setOptions({ breaks: true });
 
-const chatMessages  = document.getElementById('chat-messages');
-const questionInput = document.getElementById('question');
-const btnAsk        = document.getElementById('btn-ask');
-const modelSelect   = document.getElementById('model-select');
-const convList      = document.getElementById('conv-list');
-const btnNewChat    = document.getElementById('btn-new-chat');
+const chatMessages   = document.getElementById('chat-messages');
+const questionInput  = document.getElementById('question');
+const btnAsk         = document.getElementById('btn-ask');
+const modelSelect    = document.getElementById('model-select');
+const convList       = document.getElementById('conv-list');
+const btnNewChat     = document.getElementById('btn-new-chat');
+const chatToolbar    = document.getElementById('chat-toolbar');
+const btnExport      = document.getElementById('btn-export');
+const exportDropdown = document.getElementById('export-dropdown');
 
 // ── Conversation state ────────────────────────────────────────────────────────
 let currentConversationId = null;
@@ -19,6 +22,28 @@ if (savedModel) {
 }
 modelSelect.addEventListener('change', () => {
   localStorage.setItem(MODEL_KEY, modelSelect.value);
+});
+
+// ── Export dropdown ───────────────────────────────────────────────────────────
+btnExport.addEventListener('click', e => {
+  e.stopPropagation();
+  exportDropdown.classList.toggle('open');
+});
+
+document.addEventListener('click', () => exportDropdown.classList.remove('open'));
+
+document.getElementById('export-docx').addEventListener('click', () => {
+  if (currentConversationId) {
+    window.location.href = `/conversations/${currentConversationId}/export?format=docx`;
+  }
+  exportDropdown.classList.remove('open');
+});
+
+document.getElementById('export-rtf').addEventListener('click', () => {
+  if (currentConversationId) {
+    window.location.href = `/conversations/${currentConversationId}/export?format=rtf`;
+  }
+  exportDropdown.classList.remove('open');
 });
 
 const askStatus = document.getElementById('ask-status');
@@ -184,6 +209,7 @@ async function refreshConversationList() {
 
 async function loadConversation(vid) {
   currentConversationId = vid;
+  chatToolbar.classList.add('visible');
 
   // Update active highlight in sidebar
   document.querySelectorAll('.conv-item').forEach(el => {
@@ -223,6 +249,7 @@ async function loadConversation(vid) {
 
 function newConversation() {
   currentConversationId = null;
+  chatToolbar.classList.remove('visible');
   document.querySelectorAll('.conv-item').forEach(el => el.classList.remove('active'));
   document.querySelectorAll('.art-item.highlighted')
     .forEach(el => el.classList.remove('highlighted'));
@@ -321,6 +348,7 @@ async function ask() {
         }
         if (payload.done) {
           currentConversationId = payload.conversation_id;
+          chatToolbar.classList.add('visible');
           finalizeMsgWithCitations(msgEl, payload.citations || [], payload.suggestions || []);
           Progress.done();
           clearSteps();

@@ -533,8 +533,8 @@ class TestConversationRoutes:
          ],
          "created_at": "2024-01-01T00:00:00"},
     ])
-    def test_get_messages_citation_num_sequential(self, mock_get, client):
-        data = resp = client.get("/conversations/3/messages").get_json()
+    3(self, mock_get, client):
+        data = client.get("/conversations/3/messages").get_json()
         nums = [c["num"] for c in data[0]["citations"]]
         assert nums == [1, 2]
 

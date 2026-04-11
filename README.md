@@ -77,6 +77,14 @@ DB_PASSWORD=your_db_password
 
 # Optional — DEBUG, INFO, WARNING, ERROR
 LOG_LEVEL=INFO
+
+# Optional — override the Claude models used for each task (defaults shown)
+QUERY_BUILDER_MODEL=claude-opus-4-6
+STARTER_QUESTIONS_MODEL=claude-opus-4-6
+DEFAULT_CHAT_MODEL=claude-opus-4-6
+
+# Optional — override the embedding model
+EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
 ```
 
 ### 4. Initialise the database
@@ -172,11 +180,15 @@ Database (PostgreSQL + pgvector)
 
 ### Claude models
 
-| Task | Model |
-|---|---|
-| PubMed query generation | `claude-opus-4-6` (extended thinking — hardcoded) |
-| Starter question generation | `claude-opus-4-6` (hardcoded) |
-| Collection chat | User-selectable: Opus 4.6 / Sonnet 4.6 / Haiku 4.5; defaults to Opus 4.6; preference persisted in `localStorage` |
+| Task | Default model | Override env var |
+|---|---|---|
+| PubMed query generation (extended thinking) | `claude-opus-4-6` | `QUERY_BUILDER_MODEL` |
+| Starter question generation | `claude-opus-4-6` | `STARTER_QUESTIONS_MODEL` |
+| Collection chat | `claude-opus-4-6` | `DEFAULT_CHAT_MODEL` |
+
+The chat model can also be switched at runtime from the collection page (Opus 4.6 / Sonnet 4.6 / Haiku 4.5); the preference is persisted in `localStorage`.
+
+All tunable values — model IDs, system prompts, timeouts, chunk sizes, token limits — live in `config.py`.
 
 ### Logging
 
@@ -188,13 +200,14 @@ Logs go to the console and `logs/app.log` (rotating, 10 MB × 5 backups). Verbos
 
 ```
 app.py                   # Flask routes and all business logic
+config.py                # Central configuration — models, prompts, timeouts, limits
 db.py                    # PostgreSQL / pgvector layer
 requirements.txt
 Dockerfile
 .dockerignore
 
 templates/
-  base.html              # Shared layout (progress bar, nav)
+  base.html              # Shared layout (progress bar, breadcrumbs, nav)
   index.html             # Search + relevance review panel
   collections.html       # Collection list
   collection.html        # Collection detail + 3-column layout (articles | conversations | chat)
@@ -204,6 +217,9 @@ static/
   index.css / index.js   # Search page and review panel
   collections.css / collections.js
   collection.css / collection.js   # Chat UI, conversation sidebar, history loader
+
+tests/
+  test_app.py            # Unit tests (pytest)
 
 logs/
   .gitkeep               # Directory tracked; *.log is git-ignored
@@ -217,10 +233,15 @@ Bug reports and ideas are welcome.
 
 1. Fork the repository and create a feature branch from `main`.
 2. Make your changes — keep commits focused and descriptive.
-3. Test locally with `python app.py` before opening a pull request.
-4. Open a PR against `main` with a clear description of what changed and why.
+3. Run the unit tests and smoke-test locally before opening a pull request:
 
-There are no automated tests at this time; manual smoke-testing against a local database is expected.
+```bash
+source .venv/bin/activate
+pytest tests/
+python app.py
+```
+
+4. Open a PR against `main` with a clear description of what changed and why.
 
 ---
 

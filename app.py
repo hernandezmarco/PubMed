@@ -13,6 +13,7 @@ from flask import Flask, Response, render_template, request, stream_with_context
 from dotenv import load_dotenv
 
 import db
+import config as cfg
 
 load_dotenv()
 
@@ -55,11 +56,6 @@ _embed_log = logging.getLogger("pubmed.embed")
 app = Flask(__name__)
 client = anthropic.Anthropic()
 
-PUBMED_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
-
-ALLOWED_MODELS = {"claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"}
-DEFAULT_MODEL  = "claude-opus-4-6"
-
 # ── Embeddings ────────────────────────────────────────────────────────────────
 
 _embedder = None
@@ -69,7 +65,7 @@ def get_embedder():
     global _embedder
     if _embedder is None:
         from fastembed import TextEmbedding
-        _embedder = TextEmbedding("BAAI/bge-small-en-v1.5")
+        _embedder = TextEmbedding(cfg.EMBEDDING_MODEL)
     return _embedder
 
 
@@ -110,16 +106,10 @@ def build_pubmed_query(english_query: str) -> str:
     _claude_log.debug("op=build_query query=%r", english_query[:120])
     t0 = time.perf_counter()
     with client.messages.stream(
-        model="claude-opus-4-6",
-        max_tokens=512,
+        model=cfg.QUERY_BUILDER_MODEL,
+        max_tokens=cfg.MAX_TOKENS_PUBMED_QUERY,
         thinking={"type": "adaptive"},
-        system=(
-            "You are a biomedical librarian expert in PubMed search syntax. "
-            "Convert the user's plain-English research question into an optimal PubMed "
-            "query using MeSH terms, field tags ([MeSH Terms], [Title/Abstract], etc.), "
-            "and Boolean operators (AND, OR, NOT). "
-            "Return ONLY the raw query string — no explanation, no markdown, no quotes."
-        ),
+        system=cfg.PROMPT_PUBMED_QUERY,
         messages=[{"role": "user", "content": english_query}],
     ) as stream:
         msg = stream.get_final_message()
@@ -127,8 +117,8 @@ def build_pubmed_query(english_query: str) -> str:
         result = text_block.text.strip()
     elapsed = time.perf_counter() - t0
     _claude_log.info(
-        "op=build_query model=claude-opus-4-6 in_tokens=%d out_tokens=%d duration=%.2fs",
-        msg.usage.input_tokens, msg.usage.output_tokens, elapsed,
+        "op=build_query model=%s in_tokens=%d out_tokens=%d duration=%.2fs",
+        cfg.QUERY_BUILDER_MODEL, msg.usage.input_tokens, msg.usage.output_tokens, elapsed,
     )
     _claude_log.debug("op=build_query result=%r", result)
     return result
@@ -152,7 +142,7 @@ def _ncbi_get(url: str, params: dict, timeout: int, max_retries: int = 4) -> req
         except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as exc:
             _ncbi_handle_retry(url, attempt, max_retries, delay, exc)
             time.sleep(delay)
-            delay = min(delay * 2, 30.0)
+            delay = min(delay * 2, cfg.NCBI_BACKOFF_MAX)
 
 
 def _ncbi_handle_retry(url: str, attempt: int, max_retries: int, delay: float, exc: Exception):
@@ -173,9 +163,9 @@ def search_pubmed(query: str, max_results: int = 25) -> list[str]:
     _api_log.debug("op=esearch query=%r max=%d", query[:120], max_results)
     t0 = time.perf_counter()
     resp = _ncbi_get(
-        f"{PUBMED_BASE}/esearch.fcgi",
+        f"{cfg.PUBMED_BASE}/esearch.fcgi",
         params={"db": "pubmed", "term": query, "retmax": max_results, "retmode": "json", "sort": "relevance"},
-        timeout=10,
+        timeout=cfg.TIMEOUT_ESEARCH,
     )
     resp.raise_for_status()
     ids = resp.json()["esearchresult"]["idlist"]
@@ -193,8 +183,8 @@ def _parse_authors(article_node) -> str:
         name = f"{last} {initials}".strip() if last else collective
         if name:
             authors.append(name)
-    author_str = ", ".join(authors[:6])
-    if len(authors) > 6:
+    author_str = ", ".join(authors[:cfg.AUTHORS_DISPLAY_MAX])
+    if len(authors) > cfg.AUTHORS_DISPLAY_MAX:
         author_str += " et al."
     return author_str or "Unknown"
 
@@ -240,9 +230,9 @@ def fetch_articles(pmids: list[str]) -> list[dict]:
     _api_log.debug("op=efetch pmids=%d", len(pmids))
     t0 = time.perf_counter()
     resp = _ncbi_get(
-        f"{PUBMED_BASE}/efetch.fcgi",
+        f"{cfg.PUBMED_BASE}/efetch.fcgi",
         params={"db": "pubmed", "id": ",".join(pmids), "rettype": "abstract", "retmode": "xml"},
-        timeout=15,
+        timeout=cfg.TIMEOUT_EFETCH,
     )
     resp.raise_for_status()
     _api_log.debug("op=efetch status=%d bytes=%d", resp.status_code, len(resp.content))
@@ -273,9 +263,9 @@ def get_pmcids(pmids: list[str]) -> dict[str, str]:
     _api_log.debug("op=elink pmids=%d", len(pmids))
     t0 = time.perf_counter()
     resp = _ncbi_get(
-        f"{PUBMED_BASE}/elink.fcgi",
+        f"{cfg.PUBMED_BASE}/elink.fcgi",
         params={"dbfrom": "pubmed", "db": "pmc", "linkname": "pubmed_pmc", "id": pmids, "retmode": "json"},
-        timeout=15,
+        timeout=cfg.TIMEOUT_EFETCH,
     )
     resp.raise_for_status()
     data = resp.json()
@@ -298,9 +288,9 @@ def fetch_pmc_full_text(pmcid: str) -> str:
     _api_log.debug("op=pmc_fulltext pmcid=%s", pmcid)
     t0 = time.perf_counter()
     resp = _ncbi_get(
-        f"{PUBMED_BASE}/efetch.fcgi",
+        f"{cfg.PUBMED_BASE}/efetch.fcgi",
         params={"db": "pmc", "id": pmcid, "rettype": "full", "retmode": "xml"},
-        timeout=30,
+        timeout=cfg.TIMEOUT_PMC_FULLTEXT,
     )
     resp.raise_for_status()
     root = ET.fromstring(resp.content)
@@ -327,8 +317,8 @@ def fetch_pmc_full_text(pmcid: str) -> str:
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 def _clamp_max_results(raw: str) -> int:
-    value = int(raw) if raw else 25
-    return max(25, min(200, (value // 25) * 25))
+    value = int(raw) if raw else cfg.MAX_RESULTS_DEFAULT
+    return max(cfg.MAX_RESULTS_MIN, min(cfg.MAX_RESULTS_MAX, (value // cfg.MAX_RESULTS_MIN) * cfg.MAX_RESULTS_MIN))
 
 
 def _attach_similarities(user_query: str, results: list[dict]):
@@ -362,12 +352,12 @@ def index():
     pubmed_query = None
     error = None
     user_query = ""
-    max_results = 25
+    max_results = cfg.MAX_RESULTS_DEFAULT
 
     if request.method == "POST":
         user_query = request.form.get("query", "").strip()
         if user_query:
-            max_results = _clamp_max_results(request.form.get("max_results", "25"))
+            max_results = _clamp_max_results(request.form.get("max_results", str(cfg.MAX_RESULTS_DEFAULT)))
             results, pubmed_query, error = _run_search(user_query, max_results)
 
     return render_template(
@@ -426,7 +416,7 @@ def _store_article(cid: int, art: dict, pmcid_map: dict):
     db.add_article(cid, art, has_full_text=bool(full_text), pmcid=pmcid)
     if not db.chunks_exist(pmid):
         text_to_chunk = full_text or f"{art['title']}. {art['abstract']}"
-        chunks = chunk_text(text_to_chunk)
+        chunks = chunk_text(text_to_chunk, cfg.CHUNK_SIZE, cfg.CHUNK_OVERLAP)
         db.save_chunks(pmid, chunks, embed_texts(chunks))
 
 
@@ -437,12 +427,9 @@ def generate_starter_questions(user_query: str, articles: list[dict]) -> list[st
     t0 = time.perf_counter()
     try:
         msg = client.messages.create(
-            model="claude-opus-4-6",
-            max_tokens=256,
-            system=(
-                "Generate exactly 4 concise research questions a user might want to ask about "
-                "this collection. Return ONLY a JSON array of 4 strings, no other text."
-            ),
+            model=cfg.STARTER_QUESTIONS_MODEL,
+            max_tokens=cfg.MAX_TOKENS_STARTER_QS,
+            system=cfg.PROMPT_STARTER_QUESTIONS,
             messages=[{"role": "user", "content": f"Topic: {user_query}\n\nArticles:\n{titles}"}],
         )
         questions = json.loads(msg.content[0].text.strip())[:4]
@@ -472,17 +459,6 @@ def collection_detail(cid: int):
     )
 
 
-_RAG_SYSTEM = (
-    "You are a biomedical research assistant. Answer the user's question using "
-    "ONLY the numbered article excerpts provided. Cite sources inline as [1], [2], etc. "
-    "Be concise and precise. If the excerpts lack sufficient information, say so.\n\n"
-    "After your answer output a line containing only === followed immediately by a "
-    "JSON array of exactly 4 concise follow-up questions the user might ask next, "
-    "based on your answer. Example:\n"
-    "===\n"
-    "[\"Question one?\", \"Question two?\", \"Question three?\", \"Question four?\"]"
-)
-
 
 def _sse_emit(payload: dict) -> str:
     return f"data: {json.dumps(payload)}\n\n"
@@ -509,8 +485,8 @@ def _stream_delimited_response(
 
     with client.messages.stream(
         model=model,
-        max_tokens=2560,
-        system=_RAG_SYSTEM,
+        max_tokens=cfg.MAX_TOKENS_RAG_RESPONSE,
+        system=cfg.PROMPT_RAG_SYSTEM,
         messages=[{"role": "user", "content": f"Articles:\n\n{context}\n\nQuestion: {question}"}],
     ) as stream:
         for text in stream.text_stream:
@@ -606,13 +582,13 @@ def collection_ask(cid: int):
     question = (data.get("question") or "").strip()
     if not question:
         return {"error": "No question provided."}, 400
-    model = data.get("model", DEFAULT_MODEL)
-    if model not in ALLOWED_MODELS:
+    model = data.get("model", cfg.DEFAULT_CHAT_MODEL)
+    if model not in cfg.ALLOWED_CHAT_MODELS:
         model = DEFAULT_MODEL
     conversation_id = data.get("conversation_id")
 
     q_emb = embed_texts([question])[0]
-    top_chunks = db.semantic_search(cid, q_emb, k=5)
+    top_chunks = db.semantic_search(cid, q_emb, k=cfg.SEMANTIC_SEARCH_K)
 
     if not top_chunks:
         # Still persist the unanswered question so the conversation exists
@@ -634,7 +610,7 @@ def collection_ask(cid: int):
 
     context, citations = _build_rag_context(top_chunks)
 
-    _DELIM = "\n===\n"
+    _DELIM = cfg.RAG_DELIMITER
 
     def generate():
         t0 = time.perf_counter()

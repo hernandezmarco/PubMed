@@ -21,10 +21,6 @@ sys.modules.setdefault("fastembed", fastembed_stub)
 import app as _app  # noqa: E402  (must come after stubs)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# cosine_similarity
-# ═══════════════════════════════════════════════════════════════════════════════
-
 class TestCosineSimilarity:
     def test_identical_vectors(self):
         v = np.array([1.0, 0.0, 0.0])
@@ -51,10 +47,6 @@ class TestCosineSimilarity:
         expected = 1.0 / np.sqrt(2)
         assert _app.cosine_similarity(a, b) == pytest.approx(expected)
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# chunk_text
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class TestChunkText:
     def test_short_text_single_chunk(self):
@@ -91,11 +83,6 @@ class TestChunkText:
         # Starts: 0 (end=1000), 800 (end=1800), 1600 (end=2600 == len → break) → 3 chunks
         assert len(chunks) == 3
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# _clamp_max_results
-# ═══════════════════════════════════════════════════════════════════════════════
-
 class TestClampMaxResults:
     def test_default_empty_string(self):
         assert _app._clamp_max_results("") == 25
@@ -117,11 +104,6 @@ class TestClampMaxResults:
 
     def test_multiple_of_25_unchanged(self):
         assert _app._clamp_max_results("75") == 75
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# _parse_authors
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def _make_article_xml(authors_xml: str, abstract_xml: str = "", extra: str = "") -> ET.Element:
     xml = f"""
@@ -185,9 +167,6 @@ class TestParseAuthors:
         assert _app._parse_authors(node) == "The Study Group"
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# _parse_abstract
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class TestParseAbstract:
     def test_plain_abstract(self):
@@ -215,10 +194,6 @@ class TestParseAbstract:
         assert _app._parse_abstract(node) == ""
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# _sse_emit
-# ═══════════════════════════════════════════════════════════════════════════════
-
 class TestSseEmit:
     def test_format(self):
         result = _app._sse_emit({"text": "hello"})
@@ -229,10 +204,6 @@ class TestSseEmit:
         payload = json.loads(result[6:].strip())
         assert payload == {"done": True, "citations": []}
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# _parse_suggestions
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class TestParseSuggestions:
     def test_valid_json_array(self):
@@ -254,9 +225,6 @@ class TestParseSuggestions:
         assert _app._parse_suggestions(raw) == ["Q1?"]
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# _advance_delimiter_state
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class TestAdvanceDelimiterState:
     DELIM = "\n===\n"
@@ -299,9 +267,6 @@ class TestAdvanceDelimiterState:
         assert len(events) > 0 or len(pre) <= len(self.DELIM)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# _build_rag_context
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class TestBuildRagContext:
     def _make_chunk(self, pmid, title="T", authors="A", journal="J", year="2024",

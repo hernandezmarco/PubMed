@@ -61,6 +61,7 @@ _claude_log = logging.getLogger("pubmed.claude")
 _embed_log = logging.getLogger("pubmed.embed")
 
 app = Flask(__name__)
+app.jinja_env.globals["static_version"] = cfg.STATIC_VERSION
 client = anthropic.Anthropic()
 
 # ── Embeddings ────────────────────────────────────────────────────────────────
@@ -533,11 +534,15 @@ def _stream_delimited_response(
                 pre, post, found, text, delim, emit
             )
             events.extend(chunk_events)
-        final_msg = stream.get_final_message()
-        usage = {
-            "input_tokens":  final_msg.usage.input_tokens,
-            "output_tokens": final_msg.usage.output_tokens,
-        }
+        try:
+            final_msg = stream.get_final_message()
+            usage = {
+                "input_tokens":  final_msg.usage.input_tokens,
+                "output_tokens": final_msg.usage.output_tokens,
+            }
+        except Exception as exc:
+            _claude_log.warning("op=stream_usage failed: %s", exc)
+            usage = {"input_tokens": 0, "output_tokens": 0}
 
     if not found and pre:
         events.append(emit({"text": pre}))

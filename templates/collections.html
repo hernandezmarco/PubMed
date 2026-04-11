@@ -3,7 +3,7 @@
 {% block title %}RAG Collections — PubMed AI{% endblock %}
 
 {% block extra_css %}
-<link rel="stylesheet" href="{{ url_for('static', filename='collections.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='collections.css') }}?v={{ static_version }}">
 {% endblock %}
 
 {% block header %}
@@ -52,5 +52,5 @@
 {% endblock %}
 
 {% block extra_js %}
-<script src="{{ url_for('static', filename='collections.js') }}"></script>
+<script src="{{ url_for('static', filename='collections.js') }}?v={{ static_version }}"></script>
 {% endblock %}

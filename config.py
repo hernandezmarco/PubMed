@@ -69,6 +69,10 @@ CHUNK_OVERLAP = 200
 
 AUTHORS_DISPLAY_MAX = 6   # show up to N authors, then "et al."
 
+# ── Static asset version (bump to bust browser cache after JS/CSS changes) ────
+
+STATIC_VERSION = "2"
+
 # ── Streaming ─────────────────────────────────────────────────────────────────
 
 RAG_DELIMITER = "\n===\n"   # separates the answer from the follow-up JSON array

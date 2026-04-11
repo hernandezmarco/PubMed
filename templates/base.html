@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{% block title %}PubMed AI Search{% endblock %}</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='base.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='base.css') }}?v={{ static_version }}">
   {% block extra_css %}{% endblock %}
 </head>
 <body>
@@ -12,7 +12,7 @@
 <header>{% block header %}{% endblock %}</header>
 {% block breadcrumb %}{% endblock %}
 {% block content %}{% endblock %}
-<script src="{{ url_for('static', filename='base.js') }}"></script>
+<script src="{{ url_for('static', filename='base.js') }}?v={{ static_version }}"></script>
 {% block extra_js %}{% endblock %}
 </body>
 </html>

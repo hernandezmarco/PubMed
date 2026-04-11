@@ -3,7 +3,7 @@
 {% block title %}{{ collection.name }} — PubMed AI{% endblock %}
 
 {% block extra_css %}
-<link rel="stylesheet" href="{{ url_for('static', filename='collection.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='collection.css') }}?v={{ static_version }}">
 {% endblock %}
 
 {% block header %}
@@ -110,5 +110,5 @@ const COLLECTION_ID = {{ collection.id }};
 const STARTER_QUESTIONS = {{ starter_questions | tojson }};
 </script>
 <script src="https://cdn.jsdelivr.net/npm/marked@9/marked.min.js"></script>
-<script src="{{ url_for('static', filename='collection.js') }}"></script>
+<script src="{{ url_for('static', filename='collection.js') }}?v={{ static_version }}"></script>
 {% endblock %}

@@ -76,6 +76,10 @@ DB_NAME=pubmed_ai
 DB_USER=your_db_user
 DB_PASSWORD=your_db_password
 
+# Optional — NCBI E-utilities API key (raises rate limit 3 → 10 req/s)
+# Register free at https://www.ncbi.nlm.nih.gov/account/
+PUBMED_API=your_ncbi_api_key
+
 # Optional — DEBUG, INFO, WARNING, ERROR
 LOG_LEVEL=INFO
 
@@ -127,6 +131,7 @@ docker run -p 127.0.0.1:8080:8080 \
   -e DB_NAME=pubmed_ai \
   -e DB_USER=your_db_user \
   -e DB_PASSWORD=your_db_password \
+  -e PUBMED_API=your_ncbi_api_key \
   -e LOG_LEVEL=INFO \
   -v $(pwd)/logs:/app/logs \
   pubmed-ai

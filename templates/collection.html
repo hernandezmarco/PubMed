@@ -73,13 +73,9 @@
         <div class="icon">&#128270;</div>
         <div>Ask a question about this collection of {{ collection.article_count }} articles</div>
         <div style="font-size:.8rem;color:#bbb">Claude answers using article chunks (full text where available) and cites sources</div>
-        {% if starter_questions %}
-        <div class="suggestions-row" style="justify-content:center;margin-top:1rem;">
-          {% for q in starter_questions %}
-          <button class="suggestion-chip starter-chip">{{ q }}</button>
-          {% endfor %}
+        <div id="starter-loading" class="starter-loading">
+          <div class="starter-spinner"></div>
         </div>
-        {% endif %}
       </div>
     </div>
 
@@ -107,7 +103,6 @@
 {% block extra_js %}
 <script>
 const COLLECTION_ID = {{ collection.id }};
-const STARTER_QUESTIONS = {{ starter_questions | tojson }};
 </script>
 <script src="https://cdn.jsdelivr.net/npm/marked@9/marked.min.js"></script>
 <script src="{{ url_for('static', filename='collection.js') }}?v={{ static_version }}"></script>

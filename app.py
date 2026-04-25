@@ -60,6 +60,8 @@ _api_log   = logging.getLogger("pubmed.api")
 _claude_log = logging.getLogger("pubmed.claude")
 _embed_log = logging.getLogger("pubmed.embed")
 
+_starter_questions_cache: dict[int, list[str]] = {}
+
 app = Flask(__name__)
 app.jinja_env.globals["static_version"] = cfg.STATIC_VERSION
 client = anthropic.Anthropic()
@@ -140,6 +142,8 @@ def _ncbi_get(url: str, params: dict, timeout: int, max_retries: int = 4) -> req
     Delays: 1 s, 2 s, 4 s, 8 s (doubles each attempt, capped at 30 s).
     Raises the last exception if all retries are exhausted.
     """
+    if cfg.PUBMED_API_KEY:
+        params = {**params, "api_key": cfg.PUBMED_API_KEY}
     delay = 1.0
     for attempt in range(max_retries + 1):
         try:
@@ -483,13 +487,24 @@ def collection_detail(cid: int):
     if not collection:
         return "Collection not found", 404
     articles = db.get_collection_articles(cid)
-    starter_questions = generate_starter_questions(collection["user_query"], articles)
     return render_template(
         "collection.html",
         collection=collection,
         articles=articles,
-        starter_questions=starter_questions,
     )
+
+
+@app.route("/collections/<int:cid>/starter-questions", methods=["GET"])
+def collection_starter_questions(cid: int):
+    if cid not in _starter_questions_cache:
+        collection = db.get_collection(cid)
+        if not collection:
+            return {"questions": []}
+        articles = db.get_collection_articles(cid)
+        _starter_questions_cache[cid] = generate_starter_questions(
+            collection["user_query"], articles
+        )
+    return {"questions": _starter_questions_cache[cid]}
 
 
 
@@ -625,6 +640,16 @@ def conversation_messages(vid: int):
     return db.get_conversation_messages(vid)
 
 
+@app.route("/conversations/<int:vid>/rename", methods=["PATCH"])
+def conversation_rename(vid: int):
+    data  = request.get_json(force=True)
+    title = (data.get("title") or "").strip()
+    if not title:
+        return {"error": "Title cannot be empty."}, 400
+    db.rename_conversation(vid, title)
+    return {"ok": True}
+
+
 @app.route("/conversations/<int:vid>/delete", methods=["POST"])
 def conversation_delete(vid: int):
     db.delete_conversation(vid)
@@ -688,9 +713,15 @@ def collection_ask(cid: int):
             "op=collection_ask cid=%d chunks=%d question=%r",
             cid, len(top_chunks), question[:120],
         )
-        answer_text, suggestions_json, usage = _stream_delimited_response(
-            model, context, question, _DELIM, _sse_emit
-        )
+        try:
+            answer_text, suggestions_json, usage = _stream_delimited_response(
+                model, context, question, _DELIM, _sse_emit
+            )
+        except Exception as exc:
+            _claude_log.error("op=collection_ask FAILED cid=%d: %s", cid, exc)
+            yield _sse_emit({"error": str(exc)})
+            return
+
         yield from answer_text
 
         full_answer = _extract_answer_from_events(answer_text)
@@ -765,6 +796,39 @@ def _rtf_line_with_links(text: str, url_map: dict) -> str:
     return ''.join(out)
 
 
+def _rtf_citation_line(c: dict) -> str:
+    """Return the RTF line string for a single citation entry."""
+    num     = c.get('num', '')
+    url     = c.get('url', '')
+    ctitle  = c.get('title', '')
+    journal = c.get('journal')
+    meta    = ''
+    if journal:
+        year = c.get('year')
+        meta = f" - {journal} ({year})" if year else f" - {journal}"
+    link = _rtf_hyperlink(url, ctitle) if url else _rtf_esc(ctitle)
+    return r'\pard [' + _rtf_esc(str(num)) + '] ' + link + _rtf_esc(meta) + r'\par'
+
+
+def _rtf_user_turn(msg: dict) -> str:
+    """Return the RTF line string for a user message."""
+    return r'\pard\cf1\b You:\b0\cf0 ' + _rtf_esc(msg['content']) + r'\par'
+
+
+def _rtf_assistant_turn(msg: dict) -> list[str]:
+    """Return the RTF line strings for an assistant message with optional citations."""
+    citations = msg.get('citations') or []
+    url_map   = {c['num']: c['url'] for c in citations if 'num' in c and 'url' in c}
+    result    = [r'\pard\b Claude:\b0\par']
+    for line in msg['content'].split('\n'):
+        result.append(r'\pard ' + _rtf_line_with_links(line, url_map) + r'\par')
+    if citations:
+        result.append(r'\pard\par\pard\b\fs18 Sources\b0\fs20\par')
+        for c in citations:
+            result.append(_rtf_citation_line(c))
+    return result
+
+
 def _build_rtf(title: str, collection_name: str, created_at: str, messages: list[dict]) -> str:
     lines = [
         r'{\rtf1\ansi\ansicpg1252\deff0',
@@ -778,26 +842,9 @@ def _build_rtf(title: str, collection_name: str, created_at: str, messages: list
     ]
     for msg in messages:
         if msg['role'] == 'user':
-            lines.append(r'\pard\cf1\b You:\b0\cf0 ' + _rtf_esc(msg['content']) + r'\par')
+            lines.append(_rtf_user_turn(msg))
         else:
-            citations = msg.get('citations') or []
-            url_map = {c['num']: c['url'] for c in citations if 'num' in c and 'url' in c}
-            lines.append(r'\pard\b Claude:\b0\par')
-            for line in msg['content'].split('\n'):
-                lines.append(r'\pard ' + _rtf_line_with_links(line, url_map) + r'\par')
-            if citations:
-                lines.append(r'\pard\par\pard\b\fs18 Sources\b0\fs20\par')
-                for c in citations:
-                    num  = c.get('num', '')
-                    url  = c.get('url', '')
-                    ctitle = c.get('title', '')
-                    meta = ''
-                    if c.get('journal'):
-                        meta = f" - {c['journal']}"
-                        if c.get('year'):
-                            meta += f" ({c['year']})"
-                    link = _rtf_hyperlink(url, ctitle) if url else _rtf_esc(ctitle)
-                    lines.append(r'\pard [' + _rtf_esc(str(num)) + '] ' + link + _rtf_esc(meta) + r'\par')
+            lines.extend(_rtf_assistant_turn(msg))
         lines.append(r'\pard\par')
     lines.append('}')
     return '\n'.join(lines)
@@ -843,6 +890,51 @@ def _docx_append_with_links(para, text: str, url_map: dict):
             para.add_run(part)
 
 
+def _render_citation(doc, c: dict):
+    """Append a single citation paragraph to *doc*."""
+    item = doc.add_paragraph()
+    item.add_run(f'[{c.get("num", "")}] ')
+    url    = c.get('url', '')
+    ctitle = c.get('title', '')
+    if url:
+        _docx_add_hyperlink(item, url, ctitle)
+    else:
+        item.add_run(ctitle)
+    journal = c.get('journal')
+    if journal:
+        year    = c.get('year')
+        suffix  = f" \u2013 {journal} ({year})" if year else f" \u2013 {journal}"
+        item.add_run(suffix).italic = True
+
+
+def _render_user_turn(doc, msg: dict):
+    """Append a user message paragraph to *doc*."""
+    p     = doc.add_paragraph()
+    label = p.add_run('You:  ')
+    label.bold = True
+    label.font.color.rgb = RGBColor(0x0F, 0x34, 0x60)
+    p.add_run(msg['content'])
+
+
+def _render_assistant_turn(doc, msg: dict):
+    """Append an assistant message (with optional citations) to *doc*."""
+    citations = msg.get('citations') or []
+    url_map   = {c['num']: c['url'] for c in citations if 'num' in c and 'url' in c}
+
+    lines = msg['content'].split('\n')
+    p = doc.add_paragraph()
+    p.add_run('Claude:  ').bold = True
+    _docx_append_with_links(p, lines[0], url_map)
+    for line in lines[1:]:
+        p = doc.add_paragraph()
+        _docx_append_with_links(p, line, url_map)
+
+    if citations:
+        doc.add_paragraph().add_run('Sources:').bold = True
+        for c in citations:
+            _render_citation(doc, c)
+
+
 def _build_docx(title: str, collection_name: str, created_at: str, messages: list[dict]) -> io.BytesIO:
     doc = Document()
     doc.add_heading(title, level=1)
@@ -853,42 +945,9 @@ def _build_docx(title: str, collection_name: str, created_at: str, messages: lis
 
     for msg in messages:
         if msg['role'] == 'user':
-            p = doc.add_paragraph()
-            label = p.add_run('You:  ')
-            label.bold = True
-            label.font.color.rgb = RGBColor(0x0F, 0x34, 0x60)
-            p.add_run(msg['content'])
+            _render_user_turn(doc, msg)
         else:
-            citations = msg.get('citations') or []
-            url_map = {c['num']: c['url'] for c in citations if 'num' in c and 'url' in c}
-
-            first = True
-            for line in msg['content'].split('\n'):
-                p = doc.add_paragraph()
-                if first:
-                    p.add_run('Claude:  ').bold = True
-                    first = False
-                _docx_append_with_links(p, line, url_map)
-
-            if citations:
-                src = doc.add_paragraph()
-                src.add_run('Sources:').bold = True
-                for c in citations:
-                    item = doc.add_paragraph()
-                    num  = c.get('num', '')
-                    url  = c.get('url', '')
-                    ctitle = c.get('title', '')
-                    item.add_run(f'[{num}] ')
-                    if url:
-                        _docx_add_hyperlink(item, url, ctitle)
-                    else:
-                        item.add_run(ctitle)
-                    if c.get('journal'):
-                        suffix = f" \u2013 {c['journal']}"
-                        if c.get('year'):
-                            suffix += f" ({c['year']})"
-                        item.add_run(suffix).italic = True
-
+            _render_assistant_turn(doc, msg)
         doc.add_paragraph()
 
     buf = io.BytesIO()

@@ -15,10 +15,11 @@ pip install --quiet pytest
 mkdir -p "$RESULTS_DIR"
 
 echo "Running tests..."
-python -m pytest tests/ \
-    --junit-xml="$RESULTS_DIR/results.xml" \
-    -v \
+python -m pytest tests/ -v \
+    --cov=. \
+    --cov-report=xml:"$RESULTS_DIR/coverage.xml" \
+    --cov-report=term-missing \
     "$@"
 
 echo ""
-echo "XML report written to: $RESULTS_DIR/results.xml"
+echo "XML report written to: $RESULTS_DIR/coverage.xml"

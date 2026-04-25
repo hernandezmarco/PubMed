@@ -353,6 +353,16 @@ def get_conversation_messages(vid: int) -> list[dict]:
     return rows
 
 
+def rename_conversation(vid: int, title: str) -> None:
+    t0 = time.perf_counter()
+    with db_conn() as conn:
+        conn.cursor().execute(
+            "UPDATE conversations SET title = %s WHERE id = %s",
+            (title[:120], vid),
+        )
+    _log.info("op=rename_conversation vid=%d duration=%.3fs", vid, time.perf_counter() - t0)
+
+
 def delete_conversation(vid: int):
     t0 = time.perf_counter()
     with db_conn() as conn:

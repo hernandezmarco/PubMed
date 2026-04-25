@@ -106,7 +106,8 @@ header .meta { font-size: .82rem; opacity: .7; margin-top: .3rem; }
   margin-bottom: .2rem;
 }
 .conv-item:hover { background: #f0f6ff; }
-.conv-item:hover .conv-delete { opacity: 1; }
+.conv-item:hover .conv-delete  { opacity: 1; }
+.conv-item:hover .conv-rename  { opacity: 1; }
 .conv-item.active { background: #e6f0ff; }
 
 .conv-item-title {
@@ -116,13 +117,45 @@ header .meta { font-size: .82rem; opacity: .7; margin-top: .3rem; }
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  padding-right: 18px; /* room for delete btn */
+  padding-right: 38px; /* room for rename + delete buttons */
 }
 
 .conv-item-date {
   font-size: .68rem;
   color: #aaa;
   margin-top: .15rem;
+}
+
+.conv-rename {
+  position: absolute;
+  top: 50%;
+  right: 1.4rem;
+  transform: translateY(-50%);
+  opacity: 0;
+  background: none;
+  border: none;
+  color: #bbb;
+  font-size: .8rem;
+  cursor: pointer;
+  padding: .1rem .2rem;
+  border-radius: 3px;
+  line-height: 1;
+  transition: color .15s, opacity .15s;
+}
+.conv-rename:hover { color: #0f3460; }
+
+.conv-rename-input {
+  width: 100%;
+  font-size: .78rem;
+  font-weight: 500;
+  color: #0f3460;
+  font-family: inherit;
+  border: 1px solid #c5d8f5;
+  border-radius: 4px;
+  padding: .1rem .3rem;
+  background: #fff;
+  outline: none;
+  box-sizing: border-box;
 }
 
 .conv-delete {
@@ -292,6 +325,26 @@ header .meta { font-size: .82rem; opacity: .7; margin-top: .3rem; }
   line-height: 1.4;
 }
 .suggestion-chip:hover { background: #dceeff; border-color: #0f3460; }
+
+/* ── Starter questions loading spinner ── */
+.starter-loading {
+  display: flex;
+  justify-content: center;
+  margin-top: 1rem;
+  padding-top: .65rem;
+  border-top: 1px solid #eee;
+}
+.starter-spinner {
+  width: 20px;
+  height: 20px;
+  border: 2px solid #c5d8f5;
+  border-top-color: #0f3460;
+  border-radius: 50%;
+  animation: starter-spin .7s linear infinite;
+}
+@keyframes starter-spin {
+  to { transform: rotate(360deg); }
+}
 
 .cite-link { color: #0f3460; text-decoration: none; font-weight: 700; }
 .cite-link:hover { text-decoration: underline; }

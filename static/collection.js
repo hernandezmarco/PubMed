@@ -12,6 +12,7 @@ const exportDropdown = document.getElementById('export-dropdown');
 
 // ── Conversation state ────────────────────────────────────────────────────────
 let currentConversationId = null;
+let starterQuestions = [];
 
 // ── Model display names ───────────────────────────────────────────────────────
 const MODEL_NAMES = {
@@ -243,11 +244,20 @@ function renderConversationList(list) {
     item.innerHTML =
       `<div class="conv-item-title">${escapeHtml(c.title)}</div>` +
       `<div class="conv-item-date">${formatDate(c.created_at)}</div>` +
+      `<button class="conv-rename" title="Rename conversation">&#9998;</button>` +
       `<button class="conv-delete" title="Delete conversation" data-id="${c.id}">&times;</button>`;
 
     item.addEventListener('click', e => {
       if (e.target.classList.contains('conv-delete')) return;
+      if (e.target.classList.contains('conv-rename')) return;
+      if (e.target.classList.contains('conv-rename-input')) return;
       loadConversation(c.id);
+    });
+
+    item.querySelector('.conv-rename').addEventListener('click', e => {
+      e.stopPropagation();
+      const titleEl = item.querySelector('.conv-item-title');
+      if (titleEl) startRename(item, c.id, titleEl.textContent);
     });
 
     item.querySelector('.conv-delete').addEventListener('click', async e => {
@@ -331,21 +341,8 @@ function newConversation() {
     '<div>Ask a question about this collection</div>' +
     '<div style="font-size:.8rem;color:#bbb">Claude answers using article chunks (full text where available) and cites sources</div>';
 
-  if (STARTER_QUESTIONS && STARTER_QUESTIONS.length) {
-    const row = document.createElement('div');
-    row.className = 'suggestions-row';
-    row.style.cssText = 'justify-content:center;margin-top:1rem;';
-    STARTER_QUESTIONS.forEach(q => {
-      const chip = document.createElement('button');
-      chip.className = 'suggestion-chip starter-chip';
-      chip.textContent = q;
-      chip.addEventListener('click', () => {
-        questionInput.value = q;
-        questionInput.focus();
-      });
-      row.appendChild(chip);
-    });
-    hint.appendChild(row);
+  if (starterQuestions.length) {
+    hint.appendChild(buildStarterRow(starterQuestions));
   }
 
   chatMessages.appendChild(hint);
@@ -404,6 +401,15 @@ async function ask() {
       for (const line of lines) {
         if (!line.startsWith('data: ')) continue;
         const payload = JSON.parse(line.slice(6));
+        if (payload.error) {
+          answerEl.textContent = 'Error: ' + payload.error;
+          msgEl.querySelector('.typing-cursor')?.remove();
+          Progress.error();
+          clearSteps();
+          btnAsk.disabled = false;
+          btnAsk.textContent = 'Ask';
+          return;
+        }
         if (payload.text) {
           if (!firstToken) {
             firstToken = true;
@@ -441,13 +447,84 @@ async function ask() {
 btnAsk.addEventListener('click', ask);
 questionInput.addEventListener('keydown', e => { if (e.key === 'Enter') ask(); });
 
-// Starter suggestion chips (server-rendered, shown before any conversation is loaded)
-document.querySelectorAll('.starter-chip').forEach(chip => {
-  chip.addEventListener('click', () => {
-    questionInput.value = chip.textContent.trim();
-    questionInput.focus();
+// ── Rename conversation ───────────────────────────────────────────────────────
+function startRename(item, convId, currentTitle) {
+  const titleEl = item.querySelector('.conv-item-title');
+  if (!titleEl) return;
+
+  const input = document.createElement('input');
+  input.className = 'conv-rename-input';
+  input.value = currentTitle;
+  titleEl.replaceWith(input);
+  input.focus();
+  input.select();
+
+  let done = false;
+
+  async function commit() {
+    if (done) return;
+    done = true;
+    const newTitle = input.value.trim();
+    if (newTitle && newTitle !== currentTitle) {
+      await fetch(`/conversations/${convId}/rename`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: newTitle }),
+      });
+      titleEl.textContent = newTitle;
+    }
+    input.replaceWith(titleEl);
+  }
+
+  function cancel() {
+    if (done) return;
+    done = true;
+    input.replaceWith(titleEl);
+  }
+
+  input.addEventListener('blur', commit);
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter')  { e.preventDefault(); input.blur(); }
+    if (e.key === 'Escape') { e.preventDefault(); cancel(); }
   });
-});
+  input.addEventListener('click', e => e.stopPropagation());
+}
+
+// ── Starter questions ─────────────────────────────────────────────────────────
+function buildStarterRow(questions) {
+  const row = document.createElement('div');
+  row.className = 'suggestions-row';
+  row.style.cssText = 'justify-content:center;margin-top:1rem;';
+  questions.forEach(q => {
+    const chip = document.createElement('button');
+    chip.className = 'suggestion-chip starter-chip';
+    chip.textContent = q;
+    chip.addEventListener('click', () => {
+      questionInput.value = q;
+      questionInput.focus();
+    });
+    row.appendChild(chip);
+  });
+  return row;
+}
+
+async function loadStarterQuestions() {
+  try {
+    const res  = await fetch(`/collections/${COLLECTION_ID}/starter-questions`);
+    const data = await res.json();
+    starterQuestions = data.questions || [];
+    const loading = document.getElementById('starter-loading');
+    if (!loading) return;
+    if (starterQuestions.length) {
+      loading.replaceWith(buildStarterRow(starterQuestions));
+    } else {
+      loading.remove();
+    }
+  } catch (err) {
+    document.getElementById('starter-loading')?.remove();
+  }
+}
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 loadConversations();
+loadStarterQuestions();

@@ -6,8 +6,10 @@ import json
 import xml.etree.ElementTree as ET
 from unittest.mock import MagicMock, patch
 
+import anthropic
 import numpy as np
 import pytest
+import requests
 
 # ── Import helpers we can test without side-effects ──────────────────────────
 # Patch heavy imports before importing app so the module loads cleanly in CI.
@@ -402,6 +404,767 @@ class TestExtractAnswerFromEvents:
         assert _app._extract_answer_from_events([]) == ""
 
 
+# ── Helpers shared by new test classes ───────────────────────────────────────
+
+def _make_stream_cm(text_tokens: list[str], query_text: str = "diabetes[MeSH]",
+                    in_tokens: int = 100, out_tokens: int = 50):
+    """Return a mock that behaves like client.messages.stream(...) as stream:"""
+    text_block = MagicMock()
+    text_block.type = "text"
+    text_block.text = query_text
+
+    final_msg = MagicMock()
+    final_msg.content = [text_block]
+    final_msg.usage.input_tokens = in_tokens
+    final_msg.usage.output_tokens = out_tokens
+
+    stream = MagicMock()
+    stream.text_stream = iter(text_tokens)
+    stream.get_final_message.return_value = final_msg
+    stream.__enter__ = MagicMock(return_value=stream)
+    stream.__exit__ = MagicMock(return_value=False)
+    return stream
+
+
+def _make_ncbi_resp(status_code: int = 200, json_data: dict | None = None,
+                    content: bytes = b""):
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.json.return_value = json_data or {}
+    resp.content = content
+    resp.raise_for_status = MagicMock()
+    return resp
+
+
+# ── get_embedder / embed_texts ────────────────────────────────────────────────
+
+class TestEmbedTexts:
+    def test_returns_numpy_arrays(self):
+        mock_embedder = MagicMock()
+        mock_embedder.embed.return_value = [np.array([0.1, 0.2, 0.3])]
+        with patch("app.get_embedder", return_value=mock_embedder):
+            result = _app.embed_texts(["hello"])
+        assert isinstance(result[0], np.ndarray)
+
+    def test_multiple_texts(self):
+        mock_embedder = MagicMock()
+        mock_embedder.embed.return_value = [np.zeros(3), np.ones(3)]
+        with patch("app.get_embedder", return_value=mock_embedder):
+            result = _app.embed_texts(["a", "b"])
+        assert len(result) == 2
+
+    def test_get_embedder_caches_instance(self):
+        _app._embedder = None
+        # fastembed is stubbed at the top of this file; TextEmbedding is a MagicMock
+        e1 = _app.get_embedder()
+        e2 = _app.get_embedder()
+        assert e1 is e2
+        _app._embedder = None  # restore
+
+
+# ── build_pubmed_query ────────────────────────────────────────────────────────
+
+class TestBuildPubmedQuery:
+    def test_returns_stripped_text(self):
+        stream_cm = _make_stream_cm([], query_text="  diabetes[MeSH]  ")
+        with patch("app.client") as mock_client:
+            mock_client.messages.stream.return_value = stream_cm
+            result = _app.build_pubmed_query("diabetes")
+        assert result == "diabetes[MeSH]"
+
+    def test_calls_claude_with_query(self):
+        stream_cm = _make_stream_cm([], query_text="result")
+        with patch("app.client") as mock_client:
+            mock_client.messages.stream.return_value = stream_cm
+            _app.build_pubmed_query("my query")
+        call_kwargs = mock_client.messages.stream.call_args.kwargs
+        assert call_kwargs["messages"][0]["content"] == "my query"
+
+
+# ── _ncbi_get retry logic ─────────────────────────────────────────────────────
+
+class TestNcbiGet:
+    def test_success_on_first_attempt(self):
+        resp = _make_ncbi_resp(200)
+        with patch("app.requests.get", return_value=resp) as mock_get, \
+             patch("app.time.sleep") as mock_sleep:
+            result = _app._ncbi_get("http://ncbi", {}, 10)
+        assert result is resp
+        mock_sleep.assert_not_called()
+
+    def test_retries_on_429(self):
+        resp_429 = _make_ncbi_resp(429)
+        resp_200 = _make_ncbi_resp(200)
+        with patch("app.requests.get", side_effect=[resp_429, resp_200]), \
+             patch("app.time.sleep"):
+            result = _app._ncbi_get("http://ncbi", {}, 10)
+        assert result.status_code == 200
+
+    def test_retries_on_500(self):
+        resp_500 = _make_ncbi_resp(500)
+        resp_200 = _make_ncbi_resp(200)
+        with patch("app.requests.get", side_effect=[resp_500, resp_200]), \
+             patch("app.time.sleep"):
+            result = _app._ncbi_get("http://ncbi", {}, 10)
+        assert result.status_code == 200
+
+    def test_retries_on_timeout(self):
+        resp_200 = _make_ncbi_resp(200)
+        with patch("app.requests.get",
+                   side_effect=[requests.Timeout(), resp_200]), \
+             patch("app.time.sleep"):
+            result = _app._ncbi_get("http://ncbi", {}, 10)
+        assert result.status_code == 200
+
+    def test_retries_on_connection_error(self):
+        resp_200 = _make_ncbi_resp(200)
+        with patch("app.requests.get",
+                   side_effect=[requests.ConnectionError(), resp_200]), \
+             patch("app.time.sleep"):
+            result = _app._ncbi_get("http://ncbi", {}, 10)
+        assert result.status_code == 200
+
+    def test_raises_after_max_retries(self):
+        with patch("app.requests.get",
+                   side_effect=requests.ConnectionError("down")), \
+             patch("app.time.sleep"):
+            with pytest.raises(requests.ConnectionError):
+                _app._ncbi_get("http://ncbi", {}, 10, max_retries=2)
+
+    def test_sleep_doubles_each_retry(self):
+        resp_200 = _make_ncbi_resp(200)
+        side_effects = [_make_ncbi_resp(429), _make_ncbi_resp(429), resp_200]
+        with patch("app.requests.get", side_effect=side_effects), \
+             patch("app.time.sleep") as mock_sleep:
+            _app._ncbi_get("http://ncbi", {}, 10)
+        delays = [call.args[0] for call in mock_sleep.call_args_list]
+        assert delays[1] == delays[0] * 2
+
+
+# ── search_pubmed ─────────────────────────────────────────────────────────────
+
+class TestSearchPubmed:
+    def test_returns_id_list(self):
+        resp = _make_ncbi_resp(200, json_data={"esearchresult": {"idlist": ["1", "2", "3"]}})
+        with patch("app._ncbi_get", return_value=resp):
+            result = _app.search_pubmed("diabetes[MeSH]", 25)
+        assert result == ["1", "2", "3"]
+
+    def test_empty_results(self):
+        resp = _make_ncbi_resp(200, json_data={"esearchresult": {"idlist": []}})
+        with patch("app._ncbi_get", return_value=resp):
+            result = _app.search_pubmed("obscure[MeSH]", 25)
+        assert result == []
+
+
+# ── _parse_article ────────────────────────────────────────────────────────────
+
+def _make_pubmed_xml(pmid="123", title="Test Title", journal="Test Journal",
+                     year="2024", authors_xml="", abstract_xml=""):
+    xml = f"""<PubmedArticleSet>
+      <PubmedArticle>
+        <MedlineCitation>
+          <PMID>{pmid}</PMID>
+          <Article>
+            <ArticleTitle>{title}.</ArticleTitle>
+            <Journal>
+              <Title>{journal}</Title>
+              <JournalIssue><PubDate><Year>{year}</Year></PubDate></JournalIssue>
+            </Journal>
+            <AuthorList>{authors_xml}</AuthorList>
+            <Abstract>{abstract_xml}</Abstract>
+          </Article>
+        </MedlineCitation>
+      </PubmedArticle>
+    </PubmedArticleSet>"""
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(xml)
+    return root.find(".//PubmedArticle")
+
+
+class TestParseArticle:
+    def test_title_trailing_period_stripped(self):
+        node = _make_pubmed_xml(title="My Article")
+        result = _app._parse_article("123", node)
+        assert result["title"] == "My Article"
+
+    def test_missing_title_uses_fallback(self):
+        import xml.etree.ElementTree as ET
+        xml = """<PubmedArticle>
+          <MedlineCitation>
+            <PMID>999</PMID>
+            <Article>
+              <Journal><Title>J</Title>
+                <JournalIssue><PubDate><Year>2020</Year></PubDate></JournalIssue>
+              </Journal>
+              <AuthorList/>
+              <Abstract/>
+            </Article>
+          </MedlineCitation>
+        </PubmedArticle>"""
+        node = ET.fromstring(xml)
+        result = _app._parse_article("999", node)
+        assert result["title"] == "No title"
+
+    def test_url_contains_pmid(self):
+        node = _make_pubmed_xml(pmid="42")
+        result = _app._parse_article("42", node)
+        assert "42" in result["url"]
+
+    def test_year_truncated_to_4_chars(self):
+        node = _make_pubmed_xml(year="2024 Jan")
+        result = _app._parse_article("1", node)
+        assert result["year"] == "2024"
+
+    def test_journal_populated(self):
+        node = _make_pubmed_xml(journal="Nature Medicine")
+        result = _app._parse_article("1", node)
+        assert result["journal"] == "Nature Medicine"
+
+
+# ── fetch_articles ────────────────────────────────────────────────────────────
+
+class TestFetchArticles:
+    def test_empty_pmids_returns_empty(self):
+        assert _app.fetch_articles([]) == []
+
+    def test_parses_xml_response(self):
+        xml_bytes = b"""<PubmedArticleSet>
+          <PubmedArticle>
+            <MedlineCitation>
+              <PMID>111</PMID>
+              <Article>
+                <ArticleTitle>Article One.</ArticleTitle>
+                <Journal>
+                  <Title>NEJM</Title>
+                  <JournalIssue><PubDate><Year>2023</Year></PubDate></JournalIssue>
+                </Journal>
+                <AuthorList/>
+                <Abstract/>
+              </Article>
+            </MedlineCitation>
+          </PubmedArticle>
+        </PubmedArticleSet>"""
+        resp = _make_ncbi_resp(200, content=xml_bytes)
+        with patch("app._ncbi_get", return_value=resp):
+            articles = _app.fetch_articles(["111"])
+        assert len(articles) == 1
+        assert articles[0]["pmid"] == "111"
+        assert articles[0]["title"] == "Article One"
+
+    def test_skips_pmids_missing_from_response(self):
+        xml_bytes = b"""<PubmedArticleSet>
+          <PubmedArticle>
+            <MedlineCitation>
+              <PMID>111</PMID>
+              <Article>
+                <ArticleTitle>Only One.</ArticleTitle>
+                <Journal>
+                  <Title>J</Title>
+                  <JournalIssue><PubDate><Year>2023</Year></PubDate></JournalIssue>
+                </Journal>
+                <AuthorList/><Abstract/>
+              </Article>
+            </MedlineCitation>
+          </PubmedArticle>
+        </PubmedArticleSet>"""
+        resp = _make_ncbi_resp(200, content=xml_bytes)
+        with patch("app._ncbi_get", return_value=resp):
+            articles = _app.fetch_articles(["111", "999"])
+        assert len(articles) == 1
+
+
+# ── get_pmcids ────────────────────────────────────────────────────────────────
+
+class TestGetPmcids:
+    def test_empty_pmids_returns_empty(self):
+        assert _app.get_pmcids([]) == {}
+
+    def test_extracts_pmcid(self):
+        data = {
+            "linksets": [{
+                "ids": ["111"],
+                "linksetdbs": [{"linkname": "pubmed_pmc", "links": ["654321"]}],
+            }]
+        }
+        resp = _make_ncbi_resp(200, json_data=data)
+        with patch("app._ncbi_get", return_value=resp):
+            result = _app.get_pmcids(["111"])
+        assert result == {"111": "654321"}
+
+    def test_skips_linkset_without_pmc_links(self):
+        data = {
+            "linksets": [{
+                "ids": ["111"],
+                "linksetdbs": [{"linkname": "pubmed_pubmed", "links": ["222"]}],
+            }]
+        }
+        resp = _make_ncbi_resp(200, json_data=data)
+        with patch("app._ncbi_get", return_value=resp):
+            result = _app.get_pmcids(["111"])
+        assert result == {}
+
+    def test_skips_empty_linkset_ids(self):
+        data = {"linksets": [{"ids": [], "linksetdbs": []}]}
+        resp = _make_ncbi_resp(200, json_data=data)
+        with patch("app._ncbi_get", return_value=resp):
+            result = _app.get_pmcids(["111"])
+        assert result == {}
+
+
+# ── fetch_pmc_full_text ───────────────────────────────────────────────────────
+
+class TestFetchPmcFullText:
+    def test_extracts_body_paragraphs(self):
+        xml_bytes = b"""<article>
+          <body>
+            <p>This is a long enough paragraph to be included in the output.</p>
+            <p>Another paragraph with sufficient length to pass the 20-char filter.</p>
+          </body>
+        </article>"""
+        resp = _make_ncbi_resp(200, content=xml_bytes)
+        with patch("app._ncbi_get", return_value=resp):
+            text = _app.fetch_pmc_full_text("PMC123")
+        assert "paragraph" in text
+
+    def test_falls_back_to_root_when_no_body(self):
+        xml_bytes = b"""<article>
+          <p>Paragraph outside body with enough text length to pass.</p>
+        </article>"""
+        resp = _make_ncbi_resp(200, content=xml_bytes)
+        with patch("app._ncbi_get", return_value=resp):
+            text = _app.fetch_pmc_full_text("PMC456")
+        assert "Paragraph" in text
+
+    def test_short_paragraphs_excluded(self):
+        xml_bytes = b"""<article><body><p>Short.</p></body></article>"""
+        resp = _make_ncbi_resp(200, content=xml_bytes)
+        with patch("app._ncbi_get", return_value=resp):
+            text = _app.fetch_pmc_full_text("PMC789")
+        assert text == ""
+
+
+# ── _attach_similarities ──────────────────────────────────────────────────────
+
+class TestAttachSimilarities:
+    def test_adds_similarity_key(self):
+        articles = [{"title": "T", "abstract": "A"}]
+        q_emb = np.array([1.0, 0.0])
+        a_emb = np.array([1.0, 0.0])
+        with patch("app.embed_texts", side_effect=[[q_emb], [a_emb]]):
+            _app._attach_similarities("query", articles)
+        assert "similarity" in articles[0]
+        assert articles[0]["similarity"] == pytest.approx(1.0)
+
+
+# ── _run_search error branches ────────────────────────────────────────────────
+
+class TestRunSearch:
+    def test_returns_results_on_success(self):
+        with patch("app.build_pubmed_query", return_value="q"), \
+             patch("app.search_pubmed", return_value=["1"]), \
+             patch("app.fetch_articles", return_value=[{"title": "T", "abstract": "A"}]), \
+             patch("app._attach_similarities"):
+            results, pubmed_q, err = _app._run_search("diabetes", 25)
+        assert err is None
+        assert pubmed_q == "q"
+
+    def test_auth_error_returns_message(self):
+        with patch("app.build_pubmed_query",
+                   side_effect=anthropic.AuthenticationError.__new__(anthropic.AuthenticationError)):
+            pass  # tested via side_effect below
+        import anthropic as _anthropic
+        with patch("app.build_pubmed_query",
+                   side_effect=_anthropic.AuthenticationError(
+                       message="bad key", response=MagicMock(), body={})):
+            results, pq, err = _app._run_search("q", 25)
+        assert results is None
+        assert "API key" in err
+
+    def test_request_exception_returns_message(self):
+        with patch("app.build_pubmed_query",
+                   side_effect=requests.RequestException("timeout")):
+            results, pq, err = _app._run_search("q", 25)
+        assert results is None
+        assert "PubMed" in err
+
+    def test_generic_exception_returns_str(self):
+        with patch("app.build_pubmed_query",
+                   side_effect=ValueError("unexpected")):
+            results, pq, err = _app._run_search("q", 25)
+        assert results is None
+        assert "unexpected" in err
+
+    def test_empty_results_skips_similarity(self):
+        with patch("app.build_pubmed_query", return_value="q"), \
+             patch("app.search_pubmed", return_value=[]), \
+             patch("app.fetch_articles", return_value=[]), \
+             patch("app._attach_similarities") as mock_sim:
+            _app._run_search("q", 25)
+        mock_sim.assert_not_called()
+
+
+# ── _try_fetch_full_text / _fetch_article_text ────────────────────────────────
+
+class TestTryFetchFullText:
+    def test_returns_text_and_pmcid_on_success(self):
+        with patch("app.fetch_pmc_full_text", return_value="full text"):
+            text, pmcid = _app._try_fetch_full_text("PMC1")
+        assert text == "full text"
+        assert pmcid == "PMC1"
+
+    def test_returns_none_none_on_exception(self):
+        with patch("app.fetch_pmc_full_text", side_effect=Exception("network")):
+            text, pmcid = _app._try_fetch_full_text("PMC1")
+        assert text is None
+        assert pmcid is None
+
+
+class TestFetchArticleText:
+    _ART = {"pmid": "111", "title": "T", "abstract": "A"}
+
+    def test_fetches_full_text_when_pmcid_available(self):
+        with patch("app._try_fetch_full_text", return_value=("full", "PMC1")) as mock_ft:
+            art, text, pmcid = _app._fetch_article_text(self._ART, {"111": "PMC1"})
+        mock_ft.assert_called_once_with("PMC1")
+        assert text == "full"
+        assert pmcid == "PMC1"
+
+    def test_returns_none_when_no_pmcid(self):
+        art, text, pmcid = _app._fetch_article_text(self._ART, {})
+        assert text is None
+        assert pmcid is None
+
+
+# ── generate_starter_questions ────────────────────────────────────────────────
+
+class TestGenerateStarterQuestions:
+    def test_returns_questions_list(self):
+        mock_msg = MagicMock()
+        mock_msg.content[0].text = '["Q1?", "Q2?", "Q3?", "Q4?"]'
+        mock_msg.usage.input_tokens = 50
+        mock_msg.usage.output_tokens = 30
+        with patch("app.client") as mock_client:
+            mock_client.messages.create.return_value = mock_msg
+            result = _app.generate_starter_questions("diabetes", [{"title": "T"}])
+        assert result == ["Q1?", "Q2?", "Q3?", "Q4?"]
+
+    def test_truncates_to_four(self):
+        mock_msg = MagicMock()
+        mock_msg.content[0].text = '["Q1?","Q2?","Q3?","Q4?","Q5?"]'
+        mock_msg.usage.input_tokens = 50
+        mock_msg.usage.output_tokens = 30
+        with patch("app.client") as mock_client:
+            mock_client.messages.create.return_value = mock_msg
+            result = _app.generate_starter_questions("q", [])
+        assert len(result) == 4
+
+    def test_returns_empty_on_exception(self):
+        with patch("app.client") as mock_client:
+            mock_client.messages.create.side_effect = Exception("api down")
+            result = _app.generate_starter_questions("q", [])
+        assert result == []
+
+
+# ── _stream_delimited_response ────────────────────────────────────────────────
+
+class TestStreamDelimitedResponse:
+    _DELIM = cfg.RAG_DELIMITER
+
+    def test_returns_events_post_and_usage(self):
+        tokens = ["Answer text", self._DELIM, '["Q1?"]']
+        stream_cm = _make_stream_cm(tokens)
+        with patch("app.client") as mock_client:
+            mock_client.messages.stream.return_value = stream_cm
+            events, post, usage = _app._stream_delimited_response(
+                "claude-sonnet-4-6", "ctx", "question", self._DELIM, _app._sse_emit
+            )
+        assert post.strip() == '["Q1?"]'
+        assert "input_tokens" in usage
+        assert "output_tokens" in usage
+
+    def test_pre_text_emitted_when_no_delimiter(self):
+        stream_cm = _make_stream_cm(["Just an answer"])
+        with patch("app.client") as mock_client:
+            mock_client.messages.stream.return_value = stream_cm
+            events, post, usage = _app._stream_delimited_response(
+                "claude-sonnet-4-6", "ctx", "question", self._DELIM, _app._sse_emit
+            )
+        full_text = _app._extract_answer_from_events(events)
+        assert "Just an answer" in full_text
+
+    def test_usage_defaults_on_exception(self):
+        stream_cm = _make_stream_cm([])
+        stream_cm.get_final_message.side_effect = Exception("stream error")
+        with patch("app.client") as mock_client:
+            mock_client.messages.stream.return_value = stream_cm
+            _, _, usage = _app._stream_delimited_response(
+                "claude-sonnet-4-6", "ctx", "q", self._DELIM, _app._sse_emit
+            )
+        assert usage == {"input_tokens": 0, "output_tokens": 0}
+
+
+# ── Flask routes ──────────────────────────────────────────────────────────────
+
+@pytest.fixture()
+def flask_client():
+    _app.app.config["TESTING"] = True
+    with _app.app.test_client() as c:
+        yield c
+
+
+class TestIndexRoute:
+    def test_get_returns_200(self, flask_client):
+        resp = flask_client.get("/")
+        assert resp.status_code == 200
+
+    def test_post_empty_query_returns_200_no_search(self, flask_client):
+        with patch("app._run_search") as mock_search:
+            resp = flask_client.post("/", data={"query": "  "})
+        assert resp.status_code == 200
+        mock_search.assert_not_called()
+
+    def test_post_with_query_calls_run_search(self, flask_client):
+        with patch("app._run_search", return_value=([], "q", None)):
+            resp = flask_client.post("/", data={"query": "diabetes"})
+        assert resp.status_code == 200
+
+    def test_post_with_error_still_returns_200(self, flask_client):
+        with patch("app._run_search", return_value=(None, None, "API key invalid")):
+            resp = flask_client.post("/", data={"query": "diabetes"})
+        assert resp.status_code == 200
+
+
+class TestCollectionsRoute:
+    def test_get_returns_200(self, flask_client):
+        with patch("app.db.list_collections", return_value=[]):
+            resp = flask_client.get("/collections")
+        assert resp.status_code == 200
+
+    def test_post_missing_name_returns_400(self, flask_client):
+        resp = flask_client.post("/collections",
+                                 json={"articles": [{"pmid": "1"}]})
+        assert resp.status_code == 400
+        assert b"name" in resp.data.lower()
+
+    def test_post_no_articles_returns_400(self, flask_client):
+        resp = flask_client.post("/collections",
+                                 json={"name": "My Collection", "articles": []})
+        assert resp.status_code == 400
+
+    def test_post_success_returns_collection_id(self, flask_client):
+        art = {"pmid": "111", "title": "T", "authors": "A", "journal": "J",
+               "year": "2024", "abstract": "Ab", "url": "http://x"}
+        with patch("app.get_pmcids", return_value={}), \
+             patch("app.db.create_collection", return_value=7), \
+             patch("app.db.add_article"), \
+             patch("app.db.chunks_exist", return_value=False), \
+             patch("app.embed_texts", return_value=[np.zeros(384)] * 2), \
+             patch("app.db.save_chunks"), \
+             patch("app._fetch_article_text", return_value=(art, None, None)):
+            resp = flask_client.post("/collections",
+                                     json={"name": "Test", "user_query": "q",
+                                           "pubmed_query": "pq", "articles": [art]})
+        assert resp.status_code == 200
+        assert resp.get_json()["id"] == 7
+
+
+class TestCollectionDetailRoute:
+    def test_returns_404_when_not_found(self, flask_client):
+        with patch("app.db.get_collection", return_value=None):
+            resp = flask_client.get("/collections/999")
+        assert resp.status_code == 404
+
+    def test_returns_200_when_found(self, flask_client):
+        col = {"id": 1, "name": "C", "user_query": "q", "pubmed_query": "pq",
+               "created_at": "2024-01-01", "article_count": 0,
+               "full_text_count": 0, "chunk_count": 0}
+        with patch("app.db.get_collection", return_value=col), \
+             patch("app.db.get_collection_articles", return_value=[]), \
+             patch("app.generate_starter_questions", return_value=[]):
+            resp = flask_client.get("/collections/1")
+        assert resp.status_code == 200
+
+
+class TestCollectionDeleteRoute:
+    def test_returns_ok(self, flask_client):
+        with patch("app.db.delete_collection"):
+            resp = flask_client.post("/collections/1/delete")
+        assert resp.status_code == 200
+        assert resp.get_json() == {"ok": True}
+
+
+class TestConversationRoutes:
+    def test_list_conversations(self, flask_client):
+        with patch("app.db.list_conversations", return_value=[{"id": 1}]):
+            resp = flask_client.get("/collections/1/conversations")
+        assert resp.status_code == 200
+
+    def test_get_messages(self, flask_client):
+        with patch("app.db.get_conversation_messages", return_value=[]):
+            resp = flask_client.get("/conversations/1/messages")
+        assert resp.status_code == 200
+
+    def test_delete_conversation(self, flask_client):
+        with patch("app.db.delete_conversation"):
+            resp = flask_client.post("/conversations/1/delete")
+        assert resp.status_code == 200
+        assert resp.get_json() == {"ok": True}
+
+
+class TestCollectionAskRoute:
+    def test_no_question_returns_400(self, flask_client):
+        resp = flask_client.post("/collections/1/ask", json={"question": ""})
+        assert resp.status_code == 400
+
+    def test_invalid_model_falls_back_to_default(self, flask_client):
+        q_emb = np.zeros(384)
+        chunk = {"pmid": "1", "title": "T", "authors": "A", "journal": "J",
+                 "year": "2024", "abstract": "ab", "url": "u",
+                 "has_full_text": False, "chunk_text": "text",
+                 "chunk_index": 0, "similarity": 0.9}
+        with patch("app.embed_texts", return_value=[q_emb]), \
+             patch("app.db.semantic_search", return_value=[chunk]), \
+             patch("app.db.create_conversation", return_value=1), \
+             patch("app.db.add_message"), \
+             patch("app._stream_delimited_response",
+                   return_value=([], "", {"input_tokens": 0, "output_tokens": 0})):
+            resp = flask_client.post("/collections/1/ask",
+                                     json={"question": "q", "model": "not-a-real-model"})
+        assert resp.status_code == 200
+
+    def test_empty_chunks_returns_no_articles_message(self, flask_client):
+        with patch("app.embed_texts", return_value=[np.zeros(384)]), \
+             patch("app.db.semantic_search", return_value=[]), \
+             patch("app.db.create_conversation", return_value=1), \
+             patch("app.db.add_message"):
+            resp = flask_client.post("/collections/1/ask",
+                                     json={"question": "What is diabetes?"})
+        data = b"".join(resp.response)
+        assert b"No articles" in data
+
+
+class TestConversationExportRoute:
+    def test_invalid_format_returns_400(self, flask_client):
+        resp = flask_client.get("/conversations/1/export?format=pdf")
+        assert resp.status_code == 400
+
+    def test_missing_conversation_returns_404(self, flask_client):
+        with patch("app.db.get_conversation", return_value=None):
+            resp = flask_client.get("/conversations/1/export?format=rtf")
+        assert resp.status_code == 404
+
+    def test_no_messages_returns_404(self, flask_client):
+        conv = {"id": 1, "title": "Chat", "collection_name": "Col", "created_at": "2024-01-01"}
+        with patch("app.db.get_conversation", return_value=conv), \
+             patch("app.db.get_conversation_messages", return_value=[]):
+            resp = flask_client.get("/conversations/1/export?format=rtf")
+        assert resp.status_code == 404
+
+    def test_rtf_export_returns_rtf_content(self, flask_client):
+        conv = {"id": 1, "title": "Chat", "collection_name": "Col", "created_at": "2024-01-01"}
+        messages = [{"role": "user", "content": "Hi", "citations": None}]
+        with patch("app.db.get_conversation", return_value=conv), \
+             patch("app.db.get_conversation_messages", return_value=messages):
+            resp = flask_client.get("/conversations/1/export?format=rtf")
+        assert resp.status_code == 200
+        assert resp.content_type == "application/rtf"
+
+    def test_docx_export_returns_docx_content(self, flask_client):
+        conv = {"id": 1, "title": "Chat", "collection_name": "Col", "created_at": "2024-01-01"}
+        messages = [{"role": "user", "content": "Hi", "citations": None}]
+        with patch("app.db.get_conversation", return_value=conv), \
+             patch("app.db.get_conversation_messages", return_value=messages):
+            resp = flask_client.get("/conversations/1/export?format=docx")
+        assert resp.status_code == 200
+        assert "wordprocessingml" in resp.content_type
+
+
+# ── RTF helpers ───────────────────────────────────────────────────────────────
+
+class TestRtfEsc:
+    def test_backslash_escaped(self):
+        assert _app._rtf_esc("a\\b") == "a\\\\b"
+
+    def test_open_brace_escaped(self):
+        assert _app._rtf_esc("{") == "\\{"
+
+    def test_close_brace_escaped(self):
+        assert _app._rtf_esc("}") == "\\}"
+
+    def test_non_ascii_encoded(self):
+        result = _app._rtf_esc("\u00e9")  # é
+        assert result == "\\u233?"
+
+    def test_plain_ascii_passthrough(self):
+        assert _app._rtf_esc("hello world") == "hello world"
+
+    def test_empty_string(self):
+        assert _app._rtf_esc("") == ""
+
+
+class TestRtfHyperlink:
+    def test_contains_hyperlink_keyword(self):
+        result = _app._rtf_hyperlink("http://example.com", "click me")
+        assert "HYPERLINK" in result
+
+    def test_contains_display_text(self):
+        result = _app._rtf_hyperlink("http://example.com", "click me")
+        assert "click me" in result
+
+    def test_url_backslash_escaped(self):
+        result = _app._rtf_hyperlink("http://x.com\\path", "t")
+        assert "\\\\" in result
+
+
+class TestRtfLineWithLinks:
+    def test_plain_text_passthrough(self):
+        result = _app._rtf_line_with_links("no markers here", {})
+        assert result == "no markers here"
+
+    def test_marker_with_url_becomes_hyperlink(self):
+        result = _app._rtf_line_with_links("See [1] for details", {1: "http://x.com"})
+        assert "HYPERLINK" in result
+        assert "details" in result
+
+    def test_marker_without_url_is_escaped_literally(self):
+        result = _app._rtf_line_with_links("See [1] here", {})
+        assert "HYPERLINK" not in result
+        assert "[1]" in result
+
+
+class TestBuildRtf:
+    def test_contains_title(self):
+        result = _app._build_rtf("My Chat", "Col", "2024-01-01T00:00:00", [])
+        assert "My Chat" in result
+
+    def test_user_message_included(self):
+        msgs = [{"role": "user", "content": "Hello there"}]
+        result = _app._build_rtf("T", "C", "2024-01-01", msgs)
+        assert "Hello there" in result
+
+    def test_assistant_message_included(self):
+        msgs = [{"role": "assistant", "content": "The answer is 42", "citations": []}]
+        result = _app._build_rtf("T", "C", "2024-01-01", msgs)
+        assert "The answer is 42" in result
+
+    def test_citations_section_present_when_citations_exist(self):
+        msgs = [{
+            "role": "assistant",
+            "content": "See [1]",
+            "citations": [{"num": 1, "url": "http://x.com", "title": "Article",
+                           "journal": "Nature", "year": "2024"}],
+        }]
+        result = _app._build_rtf("T", "C", "2024-01-01", msgs)
+        assert "Sources" in result
+        assert "Article" in result
+
+    def test_date_truncated_to_10_chars(self):
+        result = _app._build_rtf("T", "C", "2024-01-01T12:00:00Z", [])
+        assert "2024-01-01" in result
+        assert "T12:00:00Z" not in result
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Flask route tests (mocked DB + external calls)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -775,6 +1538,89 @@ class TestBuildRtf:
         assert "HYPERLINK" in rtf
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# _rtf_citation_line / _rtf_user_turn / _rtf_assistant_turn helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestRtfCitationLine:
+    def test_num_and_title_present(self):
+        result = _app._rtf_citation_line({"num": 1, "title": "My Article"})
+        assert "[1]" in result
+        assert "My Article" in result
+
+    def test_url_becomes_hyperlink(self):
+        result = _app._rtf_citation_line({"num": 2, "url": "https://example.com", "title": "Art"})
+        assert "HYPERLINK" in result
+
+    def test_no_url_plain_title(self):
+        result = _app._rtf_citation_line({"num": 3, "title": "Bare Title"})
+        assert "HYPERLINK" not in result
+        assert "Bare Title" in result
+
+    def test_journal_and_year(self):
+        result = _app._rtf_citation_line({"num": 4, "title": "T", "journal": "NEJM", "year": "2024"})
+        assert "NEJM" in result
+        assert "2024" in result
+
+    def test_journal_without_year(self):
+        result = _app._rtf_citation_line({"num": 5, "title": "T", "journal": "Lancet"})
+        assert "Lancet" in result
+        assert "(None)" not in result
+        assert "()" not in result
+
+    def test_no_journal_no_dash(self):
+        result = _app._rtf_citation_line({"num": 6, "title": "T"})
+        assert " - " not in result
+
+
+class TestRtfUserTurn:
+    def test_you_label_present(self):
+        result = _app._rtf_user_turn({"role": "user", "content": "Hello"})
+        assert "You:" in result
+
+    def test_content_present(self):
+        result = _app._rtf_user_turn({"role": "user", "content": "Hello"})
+        assert "Hello" in result
+
+    def test_returns_string(self):
+        result = _app._rtf_user_turn({"role": "user", "content": "x"})
+        assert isinstance(result, str)
+
+
+class TestRtfAssistantTurn:
+    def test_claude_label_present(self):
+        result = _app._rtf_assistant_turn({"role": "assistant", "content": "Answer"})
+        assert any("Claude:" in line for line in result)
+
+    def test_content_present(self):
+        result = _app._rtf_assistant_turn({"role": "assistant", "content": "Answer"})
+        assert any("Answer" in line for line in result)
+
+    def test_multiline_content_all_lines_present(self):
+        result = _app._rtf_assistant_turn({"role": "assistant", "content": "A\nB\nC"})
+        joined = "\n".join(result)
+        assert "A" in joined
+        assert "B" in joined
+        assert "C" in joined
+
+    def test_sources_label_present_when_citations(self):
+        msg = {
+            "role": "assistant",
+            "content": "See [1].",
+            "citations": [{"num": 1, "url": "https://example.com", "title": "Ex"}],
+        }
+        result = _app._rtf_assistant_turn(msg)
+        assert any("Sources" in line for line in result)
+
+    def test_no_sources_without_citations(self):
+        result = _app._rtf_assistant_turn({"role": "assistant", "content": "No refs"})
+        assert not any("Sources" in line for line in result)
+
+    def test_returns_list(self):
+        result = _app._rtf_assistant_turn({"role": "assistant", "content": "x"})
+        assert isinstance(result, list)
+
+
 class TestBuildDocx:
     import zipfile as _zf
     import io as _io
@@ -834,6 +1680,123 @@ class TestBuildDocx:
         with zipfile.ZipFile(io.BytesIO(result.read())) as z:
             rels = z.read("word/_rels/document.xml.rels").decode("utf-8")
         assert "pubmed" not in rels
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# _render_user_turn / _render_assistant_turn / _render_citation helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestRenderUserTurn:
+    def _xml(self, msg):
+        import io
+        from docx import Document
+        doc = Document()
+        _app._render_user_turn(doc, msg)
+        buf = io.BytesIO()
+        doc.save(buf)
+        buf.seek(0)
+        import zipfile
+        with zipfile.ZipFile(buf) as z:
+            return z.read("word/document.xml").decode("utf-8")
+
+    def test_you_label_present(self):
+        xml = self._xml({"role": "user", "content": "Hello"})
+        assert "You:" in xml
+
+    def test_user_content_present(self):
+        xml = self._xml({"role": "user", "content": "Hello"})
+        assert "Hello" in xml
+
+
+class TestRenderAssistantTurn:
+    def _xml(self, msg):
+        import io
+        from docx import Document
+        doc = Document()
+        _app._render_assistant_turn(doc, msg)
+        buf = io.BytesIO()
+        doc.save(buf)
+        buf.seek(0)
+        import zipfile
+        with zipfile.ZipFile(buf) as z:
+            return z.read("word/document.xml").decode("utf-8")
+
+    def test_claude_label_present(self):
+        xml = self._xml({"role": "assistant", "content": "Answer"})
+        assert "Claude:" in xml
+
+    def test_single_line_content_present(self):
+        xml = self._xml({"role": "assistant", "content": "Answer"})
+        assert "Answer" in xml
+
+    def test_multiline_content_all_lines_present(self):
+        xml = self._xml({"role": "assistant", "content": "Line one\nLine two\nLine three"})
+        assert "Line one" in xml
+        assert "Line two" in xml
+        assert "Line three" in xml
+
+    def test_sources_label_present_when_citations(self):
+        msg = {
+            "role": "assistant",
+            "content": "See [1].",
+            "citations": [{"num": 1, "url": "https://example.com", "title": "Ex"}],
+        }
+        xml = self._xml(msg)
+        assert "Sources:" in xml
+
+    def test_no_sources_label_without_citations(self):
+        xml = self._xml({"role": "assistant", "content": "No refs"})
+        assert "Sources:" not in xml
+
+
+class TestRenderCitation:
+    def _xml(self, c):
+        import io
+        from docx import Document
+        doc = Document()
+        _app._render_citation(doc, c)
+        buf = io.BytesIO()
+        doc.save(buf)
+        buf.seek(0)
+        import zipfile
+        with zipfile.ZipFile(buf) as z:
+            return z.read("word/document.xml").decode("utf-8")
+
+    def _rels(self, c):
+        import io
+        from docx import Document
+        doc = Document()
+        _app._render_citation(doc, c)
+        buf = io.BytesIO()
+        doc.save(buf)
+        buf.seek(0)
+        import zipfile
+        with zipfile.ZipFile(buf) as z:
+            return z.read("word/_rels/document.xml.rels").decode("utf-8")
+
+    def test_title_without_url(self):
+        xml = self._xml({"num": 1, "title": "Bare Title"})
+        assert "Bare Title" in xml
+
+    def test_url_creates_relationship(self):
+        rels = self._rels({"num": 2, "url": "https://example.com/art", "title": "Art"})
+        assert "example.com/art" in rels
+
+    def test_journal_and_year_in_xml(self):
+        xml = self._xml({"num": 3, "title": "T", "journal": "NEJM", "year": "2024"})
+        assert "NEJM" in xml
+        assert "2024" in xml
+
+    def test_journal_without_year(self):
+        xml = self._xml({"num": 4, "title": "T", "journal": "Lancet"})
+        assert "Lancet" in xml
+        # no parenthesised year should appear
+        assert "(None)" not in xml
+        assert "()" not in xml
+
+    def test_no_journal_no_suffix(self):
+        xml = self._xml({"num": 5, "title": "T"})
+        assert "\u2013" not in xml
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -917,3 +1880,40 @@ class TestConversationExportRoute:
         cd = resp.headers.get("Content-Disposition", "")
         assert "attachment" in cd
         assert ".rtf" in cd
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# conversation rename route
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestConversationRenameRoute:
+    @patch("app.db.rename_conversation")
+    def test_rename_returns_200(self, mock_rename, client):
+        resp = client.patch(
+            "/conversations/1/rename",
+            json={"title": "New Title"},
+        )
+        assert resp.status_code == 200
+        mock_rename.assert_called_once_with(1, "New Title")
+
+    @patch("app.db.rename_conversation")
+    def test_rename_returns_ok_true(self, mock_rename, client):
+        resp = client.patch("/conversations/1/rename", json={"title": "New Title"})
+        assert resp.get_json()["ok"] is True
+
+    @patch("app.db.rename_conversation")
+    def test_empty_title_returns_400(self, mock_rename, client):
+        resp = client.patch("/conversations/1/rename", json={"title": ""})
+        assert resp.status_code == 400
+        mock_rename.assert_not_called()
+
+    @patch("app.db.rename_conversation")
+    def test_whitespace_title_returns_400(self, mock_rename, client):
+        resp = client.patch("/conversations/1/rename", json={"title": "   "})
+        assert resp.status_code == 400
+        mock_rename.assert_not_called()
+
+    @patch("app.db.rename_conversation")
+    def test_title_is_stripped(self, mock_rename, client):
+        client.patch("/conversations/1/rename", json={"title": "  Trimmed  "})
+        mock_rename.assert_called_once_with(1, "Trimmed")

@@ -45,6 +45,7 @@ MAX_TOKENS_RAG_RESPONSE = 2560
 # ── NCBI / PubMed ─────────────────────────────────────────────────────────────
 
 PUBMED_BASE      = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+PUBMED_API_KEY   = os.getenv("PUBMED_API", "")   # raises rate limit 3 → 10 req/s when set
 NCBI_BACKOFF_MAX = 30.0   # seconds; cap on exponential back-off delay
 
 # ── Request timeouts (seconds) ────────────────────────────────────────────────
@@ -71,7 +72,7 @@ AUTHORS_DISPLAY_MAX = 6   # show up to N authors, then "et al."
 
 # ── Static asset version (bump to bust browser cache after JS/CSS changes) ────
 
-STATIC_VERSION = "2"
+STATIC_VERSION = "4"
 
 # ── Streaming ─────────────────────────────────────────────────────────────────
 

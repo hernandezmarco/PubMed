@@ -45,6 +45,10 @@ reviewItems.forEach(item =>
 );
 
 // ── Save ──────────────────────────────────────────────────────────────────────
+const embedProgress     = document.getElementById('embed-progress');
+const embedProgressBar  = document.getElementById('embed-progress-bar');
+const embedProgressText = document.getElementById('embed-progress-text');
+
 if (btnSave) {
   btnSave.addEventListener('click', async () => {
     const name = colName.value.trim();
@@ -63,17 +67,22 @@ if (btnSave) {
     }
 
     btnSave.disabled = true;
-    btnSave.textContent = 'Saving… (fetching full text)';
+    btnSave.textContent = 'Saving…';
     saveStatus.className = '';
     saveStatus.textContent = '';
+
+    embedProgress.style.display = 'block';
+    embedProgressBar.classList.remove('complete');
+    embedProgressBar.style.width = '0%';
+    embedProgressText.textContent = 'Starting…';
 
     bar.style.display = 'block';
     bar.style.transition = 'none';
     bar.style.width = '0%';
-    requestAnimationFrame(() => Progress.set(30, 500));
+    requestAnimationFrame(() => Progress.set(10, 300));
 
     try {
-      const res = await fetch('/collections', {
+      const res = await fetch('/collections/save-stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -83,18 +92,74 @@ if (btnSave) {
           articles: selectedArticles,
         }),
       });
-      const data = await res.json();
-      if (data.id) {
-        Progress.set(90, 200);
-        setTimeout(() => Progress.done(), 200);
-        saveStatus.className = 'ok';
-        saveStatus.innerHTML = `Saved! <a href="/collections/${data.id}">Open collection &rarr;</a>`;
-        btnSave.textContent = 'Saved';
-      } else {
-        throw new Error(data.error || 'Unknown error');
+
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `Server error ${res.status}`);
+      }
+
+      const reader  = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const evt = JSON.parse(line.slice(6));
+
+          if (evt.type === 'fetch') {
+            const pct = Math.round((evt.done / evt.total) * 65) + 5;
+            Progress.set(pct, 150);
+            embedProgressBar.style.width = `${Math.round(evt.done / evt.total * 80)}%`;
+            let txt = `Fetching ${evt.done} / ${evt.total}`;
+            if (evt.full_text || evt.abstract || evt.fallback) {
+              const parts = [];
+              if (evt.full_text)  parts.push(`${evt.full_text} full text`);
+              if (evt.abstract)   parts.push(`${evt.abstract} abstract`);
+              if (evt.fallback)   parts.push(`${evt.fallback} fallback`);
+              txt += ` · ${parts.join(' · ')}`;
+            }
+            embedProgressText.textContent = txt;
+            btnSave.textContent = `Fetching… ${evt.done} / ${evt.total}`;
+
+          } else if (evt.type === 'embedding') {
+            Progress.set(78, 200);
+            embedProgressBar.style.width = '88%';
+            embedProgressText.textContent =
+              `Embedding ${evt.count} articles (${evt.full_text} full text · ${evt.abstract} abstract)…`;
+            btnSave.textContent = 'Embedding…';
+
+          } else if (evt.type === 'done') {
+            Progress.set(95, 200);
+            setTimeout(() => Progress.done(), 300);
+            embedProgressBar.style.width = '100%';
+            embedProgressBar.classList.add('complete');
+            const parts = [];
+            if (evt.full_text)  parts.push(`${evt.full_text} full text`);
+            if (evt.abstract)   parts.push(`${evt.abstract} abstract`);
+            if (evt.fallback)   parts.push(`${evt.fallback} fallback`);
+            const summary = parts.length ? ` (${parts.join(' · ')})` : '';
+            embedProgressText.textContent = `Done — ${evt.count} articles embedded${summary}`;
+            saveStatus.className = 'ok';
+            saveStatus.innerHTML =
+              `Saved! ${evt.count} articles embedded${summary}. ` +
+              `<a href="/collections/${evt.id}">Open collection &rarr;</a>`;
+            btnSave.textContent = 'Saved';
+
+          } else if (evt.type === 'error') {
+            throw new Error(evt.message);
+          }
+        }
       }
     } catch (err) {
       Progress.error();
+      embedProgress.style.display = 'none';
       saveStatus.className = 'err';
       saveStatus.textContent = 'Error: ' + err.message;
       btnSave.disabled = false;

@@ -235,6 +235,32 @@
 #save-status.ok    { color: #27ae60; }
 #save-status.err   { color: #c0392b; }
 
+/* ── Embed progress ── */
+#embed-progress {
+  display: none;
+  padding: 0.55rem 1.25rem 0.85rem;
+  border-top: 1px solid #e8eaf0;
+}
+.embed-progress-bar-wrap {
+  height: 6px;
+  background: #e8eaf0;
+  border-radius: 3px;
+  overflow: hidden;
+  margin-bottom: 0.45rem;
+}
+.embed-progress-bar {
+  height: 100%;
+  width: 0%;
+  background: #0f3460;
+  border-radius: 3px;
+  transition: width 0.35s ease;
+}
+.embed-progress-bar.complete { background: #27ae60; }
+#embed-progress-text {
+  font-size: 0.78rem;
+  color: #555;
+}
+
 /* ── Results ── */
 .results-section { margin-top: 2rem; }
 .results-section h2 { font-size: 1.1rem; font-weight: 700; margin-bottom: 1rem; color: #0f3460; }

@@ -6,7 +6,7 @@ import os
 import re
 import time
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import anthropic
@@ -61,6 +61,7 @@ _claude_log = logging.getLogger("pubmed.claude")
 _embed_log = logging.getLogger("pubmed.embed")
 
 _starter_questions_cache: dict[int, list[str]] = {}
+_SSE_MIMETYPE = "text/event-stream"
 
 app = Flask(__name__)
 app.jinja_env.globals["static_version"] = cfg.STATIC_VERSION
@@ -436,6 +437,93 @@ def collections_save():
         return {"error": str(exc)}, 500
 
 
+def _sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+def _save_fetch_phase(articles: list[dict], pmcid_map: dict):
+    """Generator — yields SSE fetch events; returns (fetched, counts) via StopIteration.value."""
+    total = len(articles)
+    fetched: list[tuple[dict, str | None, str | None]] = []
+    counts = {"full_text": 0, "abstract": 0, "fallback": 0}
+
+    with ThreadPoolExecutor(max_workers=min(total, 8)) as executor:
+        futures = {executor.submit(_fetch_article_text, art, pmcid_map): art for art in articles}
+        for future in as_completed(futures):
+            art, full_text, pmcid = future.result()
+            fetched.append((art, full_text, pmcid))
+            had_pmcid = bool(pmcid_map.get(futures[future]["pmid"]))
+            if full_text:
+                counts["full_text"] += 1
+            elif had_pmcid:
+                counts["fallback"] += 1
+            else:
+                counts["abstract"] += 1
+            yield _sse({"type": "fetch", "done": len(fetched), "total": total, **counts})
+
+    return fetched, counts
+
+
+def _save_persist_phase(cid: int, fetched: list) -> list[tuple[str, list[str]]]:
+    """Insert article rows; return (pmid, chunks) pairs that still need embedding."""
+    pending: list[tuple[str, list[str]]] = []
+    for art, full_text, pmcid in fetched:
+        db.add_article(cid, art, has_full_text=bool(full_text), pmcid=pmcid)
+        pmid = art["pmid"]
+        if not db.chunks_exist(pmid):
+            text_to_chunk = full_text or f"{art['title']}. {art['abstract']}"
+            pending.append((pmid, chunk_text(text_to_chunk, cfg.CHUNK_SIZE, cfg.CHUNK_OVERLAP)))
+    return pending
+
+
+def _save_embed_phase(pending: list[tuple[str, list[str]]], counts: dict):
+    """Generator — yields SSE embedding event then embeds and saves all pending chunks."""
+    if not pending:
+        return
+    yield _sse({"type": "embedding", "count": len(pending),
+                "full_text": counts["full_text"],
+                "abstract": counts["abstract"] + counts["fallback"]})
+    all_chunks = [c for _, chunks in pending for c in chunks]
+    all_embeddings = embed_texts(all_chunks)
+    offset = 0
+    for pmid, chunks in pending:
+        n = len(chunks)
+        db.save_chunks(pmid, chunks, all_embeddings[offset:offset + n])
+        offset += n
+
+
+@app.route("/collections/save-stream", methods=["POST"])
+def collections_save_stream():
+    """SSE endpoint: save collection with per-article fetch + embedding progress."""
+    payload = request.get_json(force=True)
+    name = (payload.get("name") or "").strip()
+    user_query = payload.get("user_query", "")
+    pubmed_query = payload.get("pubmed_query", "")
+    articles = payload.get("articles", [])
+
+    if not name:
+        return {"error": "Collection name is required."}, 400
+    if not articles:
+        return {"error": "No articles to save."}, 400
+
+    def generate():
+        try:
+            pmcid_map = get_pmcids([a["pmid"] for a in articles])
+            cid = db.create_collection(name, user_query, pubmed_query)
+            fetched, counts = yield from _save_fetch_phase(articles, pmcid_map)
+            pending = _save_persist_phase(cid, fetched)
+            yield from _save_embed_phase(pending, counts)
+            yield _sse({"type": "done", "id": cid, "count": len(articles), **counts})
+        except Exception as exc:
+            yield _sse({"type": "error", "message": str(exc)})
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype=_SSE_MIMETYPE,
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 def _try_fetch_full_text(pmcid: str) -> tuple[str | None, str | None]:
     """Return (full_text, pmcid) — pmcid is set to None on fetch failure."""
     try:
@@ -681,7 +769,7 @@ def collection_ask(cid: int):
         def empty():
             yield f"data: {json.dumps({'text': 'No articles found in this collection.'})}\n\n"
             yield f"data: {json.dumps({'done': True, 'citations': [], 'conversation_id': conversation_id})}\n\n"
-        return Response(empty(), mimetype="text/event-stream",
+        return Response(empty(), mimetype=_SSE_MIMETYPE,
                         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     # Create / continue conversation
@@ -746,7 +834,7 @@ def collection_ask(cid: int):
 
     return Response(
         stream_with_context(generate()),
-        mimetype="text/event-stream",
+        mimetype=_SSE_MIMETYPE,
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 

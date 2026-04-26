@@ -62,8 +62,8 @@ class TestDbConn:
     def test_connection_closed_on_success_too(self):
         conn, _ = _make_conn()
         with patch("db._connect", return_value=conn):
-            with db.db_conn():
-                pass
+            with db.db_conn() as c:
+                assert c is conn
         conn.close.assert_called_once()
 
 
@@ -71,7 +71,7 @@ class TestDbConn:
 
 class TestCreateCollection:
     def test_returns_new_id(self):
-        conn, cur = _make_conn(rows=[(42,)])
+        conn, _ = _make_conn(rows=[(42,)])
         with patch("db._connect", return_value=conn):
             cid = db.create_collection("My Collection", "diabetes", "diabetes[MeSH]")
         assert cid == 42
@@ -94,7 +94,7 @@ class TestAddArticle:
     }
 
     def test_inserts_all_fields(self, mock_conn):
-        conn, cur = mock_conn
+        _, cur = mock_conn
         db.add_article(7, self._ART, has_full_text=True, pmcid="PMC123")
         sql, params = cur.execute.call_args.args
         assert "INSERT INTO rag_articles" in sql
@@ -104,13 +104,13 @@ class TestAddArticle:
         assert params[9] == "PMC123"    # pmcid
 
     def test_defaults_has_full_text_false(self, mock_conn):
-        conn, cur = mock_conn
+        _, cur = mock_conn
         db.add_article(1, self._ART)
         _, params = cur.execute.call_args.args
         assert params[8] is False
 
     def test_defaults_pmcid_none(self, mock_conn):
-        conn, cur = mock_conn
+        _, cur = mock_conn
         db.add_article(1, self._ART)
         _, params = cur.execute.call_args.args
         assert params[9] is None
@@ -120,7 +120,7 @@ class TestAddArticle:
 
 class TestChunksExist:
     def test_returns_true_when_row_found(self):
-        conn, cur = _make_conn(rows=[(1,)])
+        conn, _ = _make_conn(rows=[(1,)])
         with patch("db._connect", return_value=conn):
             assert db.chunks_exist("111") is True
 
@@ -143,7 +143,7 @@ class TestChunksExist:
 
 class TestSaveChunks:
     def test_calls_execute_values(self, mock_conn):
-        conn, cur = mock_conn
+        _, _ = mock_conn
         chunks = ["chunk one", "chunk two"]
         embs = [np.zeros(384), np.ones(384)]
         with patch("psycopg2.extras.execute_values") as mock_ev:
@@ -151,7 +151,7 @@ class TestSaveChunks:
         mock_ev.assert_called_once()
 
     def test_data_indexed_correctly(self, mock_conn):
-        conn, cur = mock_conn
+        _, _ = mock_conn
         chunks = ["alpha", "beta"]
         embs = [np.array([0.1] * 384), np.array([0.2] * 384)]
         with patch("psycopg2.extras.execute_values") as mock_ev:
@@ -161,7 +161,7 @@ class TestSaveChunks:
         assert data[1] == ("pmid-2", 1, "beta", embs[1])
 
     def test_on_conflict_in_sql(self, mock_conn):
-        conn, cur = mock_conn
+        _, _ = mock_conn
         with patch("psycopg2.extras.execute_values") as mock_ev:
             db.save_chunks("p", ["c"], [np.zeros(384)])
         sql = mock_ev.call_args.args[1]
@@ -169,7 +169,7 @@ class TestSaveChunks:
         assert "DO NOTHING" in sql
 
     def test_empty_chunks_still_calls_execute_values(self, mock_conn):
-        conn, cur = mock_conn
+        _, _ = mock_conn
         with patch("psycopg2.extras.execute_values") as mock_ev:
             db.save_chunks("p", [], [])
         mock_ev.assert_called_once()
@@ -319,7 +319,7 @@ class TestSemanticSearch:
 
 class TestDeleteCollection:
     def test_issues_delete(self, mock_conn):
-        conn, cur = mock_conn
+        _, cur = mock_conn
         db.delete_collection(5)
         sql, params = cur.execute.call_args.args
         assert "DELETE FROM rag_collections" in sql
@@ -330,7 +330,7 @@ class TestDeleteCollection:
 
 class TestCreateConversation:
     def test_returns_new_id(self):
-        conn, cur = _make_conn(rows=[(99,)])
+        conn, _ = _make_conn(rows=[(99,)])
         with patch("db._connect", return_value=conn):
             vid = db.create_conversation(3, "Chat title")
         assert vid == 99
@@ -363,7 +363,7 @@ class TestCreateConversation:
 
 class TestAddMessage:
     def test_inserts_without_citations(self, mock_conn):
-        conn, cur = mock_conn
+        _, cur = mock_conn
         db.add_message(10, "user", "Hello")
         sql, params = cur.execute.call_args.args
         assert "INSERT INTO conversation_messages" in sql
@@ -373,7 +373,7 @@ class TestAddMessage:
         assert params[3] is None
 
     def test_inserts_with_citations(self, mock_conn):
-        conn, cur = mock_conn
+        _, cur = mock_conn
         citations = [{"pmid": "123", "title": "T"}]
         db.add_message(10, "assistant", "Answer", citations=citations)
         _, params = cur.execute.call_args.args
@@ -381,13 +381,13 @@ class TestAddMessage:
         assert params[3] is not None
 
     def test_user_role(self, mock_conn):
-        conn, cur = mock_conn
+        _, cur = mock_conn
         db.add_message(1, "user", "content")
         _, params = cur.execute.call_args.args
         assert params[1] == "user"
 
     def test_assistant_role(self, mock_conn):
-        conn, cur = mock_conn
+        _, cur = mock_conn
         db.add_message(1, "assistant", "content")
         _, params = cur.execute.call_args.args
         assert params[1] == "assistant"
@@ -482,7 +482,7 @@ class TestGetConversationMessages:
 
 class TestDeleteConversation:
     def test_issues_delete(self, mock_conn):
-        conn, cur = mock_conn
+        _, cur = mock_conn
         db.delete_conversation(13)
         sql, params = cur.execute.call_args.args
         assert "DELETE FROM conversations" in sql

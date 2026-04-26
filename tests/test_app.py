@@ -486,7 +486,7 @@ class TestBuildPubmedQuery:
 class TestNcbiGet:
     def test_success_on_first_attempt(self):
         resp = _make_ncbi_resp(200)
-        with patch("app.requests.get", return_value=resp) as mock_get, \
+        with patch("app.requests.get", return_value=resp) as _, \
              patch("app.time.sleep") as mock_sleep:
             result = _app._ncbi_get("http://ncbi", {}, 10)
         assert result is resp
@@ -765,7 +765,7 @@ class TestRunSearch:
              patch("app.search_pubmed", return_value=["1"]), \
              patch("app.fetch_articles", return_value=[{"title": "T", "abstract": "A"}]), \
              patch("app._attach_similarities"):
-            results, pubmed_q, err = _app._run_search("diabetes", 25)
+            _, pubmed_q, err = _app._run_search("diabetes", 25)
         assert err is None
         assert pubmed_q == "q"
 
@@ -777,21 +777,21 @@ class TestRunSearch:
         with patch("app.build_pubmed_query",
                    side_effect=_anthropic.AuthenticationError(
                        message="bad key", response=MagicMock(), body={})):
-            results, pq, err = _app._run_search("q", 25)
+            results, _, err = _app._run_search("q", 25)
         assert results is None
         assert "API key" in err
 
     def test_request_exception_returns_message(self):
         with patch("app.build_pubmed_query",
                    side_effect=requests.RequestException("timeout")):
-            results, pq, err = _app._run_search("q", 25)
+            results, _, err = _app._run_search("q", 25)
         assert results is None
         assert "PubMed" in err
 
     def test_generic_exception_returns_str(self):
         with patch("app.build_pubmed_query",
                    side_effect=ValueError("unexpected")):
-            results, pq, err = _app._run_search("q", 25)
+            results, _, err = _app._run_search("q", 25)
         assert results is None
         assert "unexpected" in err
 
@@ -825,13 +825,13 @@ class TestFetchArticleText:
 
     def test_fetches_full_text_when_pmcid_available(self):
         with patch("app._try_fetch_full_text", return_value=("full", "PMC1")) as mock_ft:
-            art, text, pmcid = _app._fetch_article_text(self._ART, {"111": "PMC1"})
+            _, text, pmcid = _app._fetch_article_text(self._ART, {"111": "PMC1"})
         mock_ft.assert_called_once_with("PMC1")
         assert text == "full"
         assert pmcid == "PMC1"
 
     def test_returns_none_when_no_pmcid(self):
-        art, text, pmcid = _app._fetch_article_text(self._ART, {})
+        _, text, pmcid = _app._fetch_article_text(self._ART, {})
         assert text is None
         assert pmcid is None
 
@@ -876,7 +876,7 @@ class TestStreamDelimitedResponse:
         stream_cm = _make_stream_cm(tokens)
         with patch("app.client") as mock_client:
             mock_client.messages.stream.return_value = stream_cm
-            events, post, usage = _app._stream_delimited_response(
+            _, post, usage = _app._stream_delimited_response(
                 "claude-sonnet-4-6", "ctx", "question", self._DELIM, _app._sse_emit
             )
         assert post.strip() == '["Q1?"]'
@@ -887,7 +887,7 @@ class TestStreamDelimitedResponse:
         stream_cm = _make_stream_cm(["Just an answer"])
         with patch("app.client") as mock_client:
             mock_client.messages.stream.return_value = stream_cm
-            events, post, usage = _app._stream_delimited_response(
+            events, _, _ = _app._stream_delimited_response(
                 "claude-sonnet-4-6", "ctx", "question", self._DELIM, _app._sse_emit
             )
         full_text = _app._extract_answer_from_events(events)

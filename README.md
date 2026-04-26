@@ -15,7 +15,7 @@ Searching PubMed manually requires knowing MeSH terms, Boolean operators, and fi
 4. **You review and select** the most relevant articles, set a relevance threshold with a slider, and save them as a named collection.
 5. **The collection becomes a knowledge base** — full-text PMC articles are fetched where available, chunked, embedded, and stored in pgvector.
 6. **Chat with your collection** — ask follow-up questions and get cited, streamed answers grounded in the papers you saved. Inline citation markers like `[1]` are rendered as clickable superscript links that open the source article directly. Claude suggests four follow-up questions after every answer.
-7. **Conversations are saved** — every chat thread is persisted to the database. A sidebar lists past conversations by title and date; click any entry to pick up where you left off, or start a fresh thread with the **+** button.
+7. **Conversations are saved** — every chat thread is persisted to the database. A sidebar lists past conversations by title and date; click any entry to pick up where you left off, or start a fresh thread with the **+** button. Hover over a conversation to rename it inline with the pencil icon (✎) or delete it with the × button.
 8. **Export a conversation** — click **Save ▾** in the chat toolbar to download the current conversation as a Word (`.docx`) or RTF (`.rtf`) file, including the question/answer history and metadata.
 
 ---
@@ -155,11 +155,16 @@ Flask (app.py)
   │     ├── NCBI esearch/efetch     ──►  Titles, authors, abstracts
   │     └── fastembed               ──►  Cosine similarity ranking
   │
-  ├── POST /collections                  Save selected articles
-  │     ├── NCBI elink/efetch       ──►  PMC full text (parallel, up to 8 workers)
+  ├── POST /collections                  Save selected articles (synchronous)
+  │     ├── NCBI elink/efetch       ──►  PMC full text
   │     ├── chunk_text()            ──►  1 000-char chunks, 200-char overlap
   │     ├── fastembed               ──►  Batch-embed all chunks in one call
   │     └── pgvector                ──►  Batch-insert embeddings (execute_values)
+  │
+  ├── POST /collections/save-stream      Save selected articles (SSE progress stream)
+  │     ├── Phase 1 — parallel PMC fetches (as_completed), yields fetch event per article
+  │     ├── Phase 2 — DB inserts (no event, fast)
+  │     └── Phase 3 — batch embed + pgvector insert, yields embedding then done events
   │
   ├── POST /collections/<id>/ask         Chat with a collection (SSE)
   │     ├── fastembed               ──►  Embed question
@@ -167,10 +172,12 @@ Flask (app.py)
   │     ├── Claude (selectable)     ──►  Streamed cited answer + 4 follow-up suggestions
   │     └── db.add_message()        ──►  Persist user + assistant messages
   │
-  ├── GET /collections/<id>/conversations        List saved conversations
-  ├── GET /conversations/<id>/messages           Load a conversation's message history
+  ├── GET  /collections/<id>/starter-questions   Generate starter questions (cached, async)
+  ├── GET  /collections/<id>/conversations       List saved conversations
+  ├── GET  /conversations/<id>/messages          Load a conversation's message history
+  ├── PATCH /conversations/<id>/rename           Rename a conversation
   ├── POST /conversations/<id>/delete            Delete a conversation
-  └── GET /conversations/<id>/export?format=…   Download conversation as .docx or .rtf
+  └── GET  /conversations/<id>/export?format=…  Download conversation as .docx or .rtf
 
 Database (PostgreSQL + pgvector)
   ├── rag_collections        — id, name, user_query, pubmed_query, created_at
@@ -228,7 +235,8 @@ static/
   collection.css / collection.js   # Chat UI, conversation sidebar, history loader
 
 tests/
-  test_app.py            # Unit tests (pytest)
+  test_app.py            # Unit tests — routes, pure functions, helpers (pytest)
+  test_db.py             # Unit tests — database layer (mocked psycopg2)
 
 logs/
   .gitkeep               # Directory tracked; *.log is git-ignored

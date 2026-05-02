@@ -31,7 +31,10 @@
 <div class="layout">
   <!-- Left: article list -->
   <div class="articles-panel">
-    <div class="panel-title">{{ collection.article_count }} Articles &middot; {{ collection.full_text_count }} Full Text &middot; {{ collection.chunk_count }} Chunks</div>
+    <div class="panel-title">
+      <span>{{ collection.article_count }} Articles &middot; {{ collection.full_text_count }} Full Text &middot; {{ collection.chunk_count }} Chunks</span>
+      <a class="btn-csv" href="/collections/{{ collection.id }}/export.csv">&#8595; CSV</a>
+    </div>
     {% for art in articles %}
     <div class="art-item" id="art-{{ art.pmid }}">
       <div class="art-num">

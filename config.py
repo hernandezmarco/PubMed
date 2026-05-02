@@ -72,7 +72,7 @@ AUTHORS_DISPLAY_MAX = 6   # show up to N authors, then "et al."
 
 # ── Static asset version (bump to bust browser cache after JS/CSS changes) ────
 
-STATIC_VERSION = "4"
+STATIC_VERSION = "5"
 
 # ── Streaming ─────────────────────────────────────────────────────────────────
 

@@ -1,3 +1,4 @@
+import csv
 import io
 import json
 import logging
@@ -579,6 +580,34 @@ def collection_detail(cid: int):
         "collection.html",
         collection=collection,
         articles=articles,
+    )
+
+
+@app.route("/collections/<int:cid>/export.csv", methods=["GET"])
+def collection_export_csv(cid: int):
+    collection = db.get_collection(cid)
+    if not collection:
+        return "Collection not found", 404
+    articles = db.get_collection_articles(cid)
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["PMID", "Journal", "Title", "Year", "Authors", "Abstract"])
+    for art in articles:
+        writer.writerow([
+            art["pmid"],
+            art["journal"] or "",
+            art["title"] or "",
+            art["year"] or "",
+            art["authors"] or "",
+            art["abstract"] or "",
+        ])
+
+    safe_name = re.sub(r'[^\w\s-]', '', collection["name"]).strip().replace(' ', '-') or "collection"
+    return Response(
+        buf.getvalue().encode("utf-8-sig"),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}.csv"'},
     )
 
 

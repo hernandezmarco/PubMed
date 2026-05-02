@@ -17,6 +17,7 @@ Searching PubMed manually requires knowing MeSH terms, Boolean operators, and fi
 6. **Chat with your collection** — ask follow-up questions and get cited, streamed answers grounded in the papers you saved. Inline citation markers like `[1]` are rendered as clickable superscript links that open the source article directly. Claude suggests four follow-up questions after every answer.
 7. **Conversations are saved** — every chat thread is persisted to the database. A sidebar lists past conversations by title and date; click any entry to pick up where you left off, or start a fresh thread with the **+** button. Hover over a conversation to rename it inline with the pencil icon (✎) or delete it with the × button.
 8. **Export a conversation** — click **Save ▾** in the chat toolbar to download the current conversation as a Word (`.docx`) or RTF (`.rtf`) file, including the question/answer history and metadata.
+9. **Download collection metadata** — click **↓ CSV** at the top of the article list panel to download all articles in the collection as a CSV file (PMID, Journal, Title, Year, Authors, Abstract). The file is named after the collection and encoded as UTF-8 with BOM for Excel compatibility.
 
 ---
 
@@ -173,6 +174,7 @@ Flask (app.py)
   │     └── db.add_message()        ──►  Persist user + assistant messages
   │
   ├── GET  /collections/<id>/starter-questions   Generate starter questions (cached, async)
+  ├── GET  /collections/<id>/export.csv          Download article metadata as CSV
   ├── GET  /collections/<id>/conversations       List saved conversations
   ├── GET  /conversations/<id>/messages          Load a conversation's message history
   ├── PATCH /conversations/<id>/rename           Rename a conversation

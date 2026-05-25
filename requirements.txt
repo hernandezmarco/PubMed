@@ -1,0 +1,9 @@
+anthropic
+flask
+requests
+python-dotenv
+psycopg2-binary
+pgvector
+fastembed
+python-docx
+pytest-cov

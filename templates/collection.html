@@ -1,0 +1,112 @@
+{% extends "base.html" %}
+
+{% block title %}{{ collection.name }} — PubMed AI{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{{ url_for('static', filename='collection.css') }}?v={{ static_version }}">
+{% endblock %}
+
+{% block header %}
+<div class="header-top">
+  <h1>{{ collection.name }}</h1>
+</div>
+<div class="meta">
+  "{{ collection.user_query }}" &mdash;
+  {{ collection.article_count }} articles ({{ collection.full_text_count }} full text) &middot;
+  {{ collection.chunk_count }} chunks &mdash; {{ collection.created_at[:10] }}
+</div>
+{% endblock %}
+
+{% block breadcrumb %}
+<nav class="breadcrumb" aria-label="Breadcrumb">
+  <a href="/">PubMed Search</a>
+  <span class="sep">/</span>
+  <a href="/collections">Collections</a>
+  <span class="sep">/</span>
+  <span class="current">{{ collection.name }}</span>
+</nav>
+{% endblock %}
+
+{% block content %}
+<div class="layout">
+  <!-- Left: article list -->
+  <div class="articles-panel">
+    <div class="panel-title">
+      <span>{{ collection.article_count }} Articles &middot; {{ collection.full_text_count }} Full Text &middot; {{ collection.chunk_count }} Chunks</span>
+      <a class="btn-csv" href="/collections/{{ collection.id }}/export.csv">&#8595; CSV</a>
+    </div>
+    {% for art in articles %}
+    <div class="art-item" id="art-{{ art.pmid }}">
+      <div class="art-num">
+        #{{ loop.index }} &middot; PMID {{ art.pmid }}
+        {% if art.has_full_text %}<span style="margin-left:.4rem;font-size:.65rem;background:#d4edda;color:#155724;padding:.1rem .4rem;border-radius:8px;font-weight:700;">Full Text</span>{% endif %}
+      </div>
+      <div class="art-title">
+        <a href="{{ art.url }}" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;">{{ art.title }}</a>
+      </div>
+      <div class="art-meta">{{ art.journal }}{% if art.year %} &middot; {{ art.year }}{% endif %}</div>
+    </div>
+    {% endfor %}
+  </div>
+
+  <!-- Middle: conversation list -->
+  <div class="conv-sidebar" id="conv-sidebar">
+    <div class="conv-sidebar-header">
+      <span class="conv-sidebar-title">Conversations</span>
+      <button class="btn-new-chat" id="btn-new-chat" title="New conversation">+</button>
+    </div>
+    <div class="conv-list" id="conv-list">
+      <div class="conv-empty">No conversations yet</div>
+    </div>
+  </div>
+
+  <!-- Right: chat -->
+  <div class="chat-panel">
+    <div class="chat-toolbar" id="chat-toolbar">
+      <div class="export-wrap">
+        <button class="btn-export" id="btn-export">Save &#9662;</button>
+        <div class="export-dropdown" id="export-dropdown">
+          <button class="export-opt" id="export-docx">Word (.docx)</button>
+          <button class="export-opt" id="export-rtf">RTF (.rtf)</button>
+        </div>
+      </div>
+    </div>
+    <div class="chat-messages" id="chat-messages">
+      <div class="empty-chat" id="empty-hint">
+        <div class="icon">&#128270;</div>
+        <div>Ask a question about this collection of {{ collection.article_count }} articles</div>
+        <div style="font-size:.8rem;color:#bbb">Claude answers using article chunks (full text where available) and cites sources</div>
+        <div id="starter-loading" class="starter-loading">
+          <div class="starter-spinner"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="ask-status" id="ask-status">
+      <div class="ask-step" id="step-embed"><span class="dot"></span>Embedding question</div>
+      <div class="ask-step" id="step-search"><span class="dot"></span>Searching collection</div>
+      <div class="ask-step" id="step-generate"><span class="dot"></span>Generating answer</div>
+    </div>
+
+    <div class="chat-input-bar">
+      <input id="question" type="text"
+             placeholder="e.g. What are the main findings on sleep and memory consolidation?"
+             autocomplete="off">
+      <select id="model-select" class="model-select" title="Select Claude model">
+        <option value="claude-opus-4-6">Opus 4.6</option>
+        <option value="claude-sonnet-4-6">Sonnet 4.6</option>
+        <option value="claude-haiku-4-5-20251001">Haiku 4.5</option>
+      </select>
+      <button class="btn-ask" id="btn-ask">Ask</button>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+const COLLECTION_ID = {{ collection.id }};
+</script>
+<script src="https://cdn.jsdelivr.net/npm/marked@9/marked.min.js"></script>
+<script src="{{ url_for('static', filename='collection.js') }}?v={{ static_version }}"></script>
+{% endblock %}

@@ -100,7 +100,8 @@ function _onFetchEvent(evt) {
   Progress.set(pct, 150);
   embedProgressBar.style.width = `${Math.round(evt.done / evt.total * 80)}%`;
   const summary = _buildSourceSummary(evt);
-  embedProgressText.textContent = `Fetching ${evt.done} / ${evt.total}${summary ? ` · ${summary}` : ''}`;
+  const suffix = summary ? ' · ' + summary : '';
+  embedProgressText.textContent = `Fetching ${evt.done} / ${evt.total}${suffix}`;
   btnSave.textContent = `Fetching… ${evt.done} / ${evt.total}`;
 }
 

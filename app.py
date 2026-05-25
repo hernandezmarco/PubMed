@@ -91,14 +91,15 @@ def get_embedder():
     global _embedder
     if _embedder is None:
         from fastembed import TextEmbedding
-        _embedder = TextEmbedding(cfg.EMBEDDING_MODEL)
+        _embedder = TextEmbedding(cfg.EMBEDDING_MODEL, threads=cfg.EMBED_THREADS)
+        _embed_log.info("Embedder loaded model=%s threads=%d", cfg.EMBEDDING_MODEL, cfg.EMBED_THREADS)
     return _embedder
 
 
 def embed_texts(texts: list[str]) -> list[np.ndarray]:
     _embed_log.debug("Embedding %d text(s)", len(texts))
     t0 = time.perf_counter()
-    result = [np.array(v, dtype=np.float32) for v in get_embedder().embed(texts)]
+    result = [np.array(v, dtype=np.float32) for v in get_embedder().embed(texts, batch_size=cfg.EMBED_BATCH_SIZE)]
     elapsed = time.perf_counter() - t0
     dim = len(result[0]) if result else 0
     _embed_log.info("Embedded texts=%d dim=%d duration=%.3fs", len(texts), dim, elapsed)
@@ -187,10 +188,27 @@ def _ncbi_handle_retry(url: str, attempt: int, max_retries: int, delay: float, e
     )
 
 
+def _ncbi_post(url: str, params: dict, timeout: int, max_retries: int = 4) -> requests.Response:
+    """POST with exponential back-off — used for long queries that exceed GET URL limits."""
+    if cfg.PUBMED_API_KEY:
+        params = {**params, "api_key": cfg.PUBMED_API_KEY}
+    delay = 1.0
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.post(url, data=params, timeout=timeout)
+            if resp.status_code == 429 or resp.status_code >= 500:
+                raise requests.HTTPError(response=resp)
+            return resp
+        except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as exc:
+            _ncbi_handle_retry(url, attempt, max_retries, delay, exc)
+            time.sleep(delay)
+            delay = min(delay * 2, cfg.NCBI_BACKOFF_MAX)
+
+
 def search_pubmed(query: str, max_results: int = 25) -> list[str]:
     _api_log.debug("op=esearch query=%r max=%d", query[:120], max_results)
     t0 = time.perf_counter()
-    resp = _ncbi_get(
+    resp = _ncbi_post(
         f"{cfg.PUBMED_BASE}/esearch.fcgi",
         params={"db": "pubmed", "term": query, "retmax": max_results, "retmode": "json", "sort": "relevance"},
         timeout=cfg.TIMEOUT_ESEARCH,
@@ -284,30 +302,43 @@ def fetch_articles(pmids: list[str]) -> list[dict]:
 
 # ── PMC full-text helpers ─────────────────────────────────────────────────────
 
+def _extract_pmcid(linkset: dict) -> tuple[str, str] | None:
+    ids = linkset.get("ids", [])
+    if not ids:
+        return None
+    pmid = str(ids[0])
+    for lsdb in linkset.get("linksetdbs", []):
+        if lsdb.get("linkname") == "pubmed_pmc" and lsdb.get("links"):
+            return pmid, str(lsdb["links"][0])
+    return None
+
+
+def _fetch_pmcid_batch(batch: list[str]) -> dict[str, str]:
+    resp = _ncbi_post(
+        f"{cfg.PUBMED_BASE}/elink.fcgi",
+        params={"dbfrom": "pubmed", "db": "pmc", "linkname": "pubmed_pmc", "id": batch, "retmode": "json"},
+        timeout=cfg.TIMEOUT_ELINK,
+    )
+    resp.raise_for_status()
+    return dict(
+        p for p in map(_extract_pmcid, resp.json().get("linksets", [])) if p is not None
+    )
+
+
 def get_pmcids(pmids: list[str]) -> dict[str, str]:
-    """Return {pmid: pmcid} for articles that have PMC full text."""
+    """Return {pmid: pmcid} for articles that have PMC full text.
+
+    Sends PMIDs in batches via POST to avoid URL-length timeouts on large sets.
+    """
     if not pmids:
         return {}
     _api_log.debug("op=elink pmids=%d", len(pmids))
     t0 = time.perf_counter()
-    resp = _ncbi_get(
-        f"{cfg.PUBMED_BASE}/elink.fcgi",
-        params={"dbfrom": "pubmed", "db": "pmc", "linkname": "pubmed_pmc", "id": pmids, "retmode": "json"},
-        timeout=cfg.TIMEOUT_EFETCH,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    result = {}
-    for linkset in data.get("linksets", []):
-        ids = linkset.get("ids", [])
-        pmid = str(ids[0]) if ids else None
-        if not pmid:
-            continue
-        for lsdb in linkset.get("linksetdbs", []):
-            if lsdb.get("linkname") == "pubmed_pmc" and lsdb.get("links"):
-                result[pmid] = str(lsdb["links"][0])
+    result: dict[str, str] = {}
+    for i in range(0, len(pmids), cfg.ELINK_BATCH_SIZE):
+        result.update(_fetch_pmcid_batch(pmids[i:i + cfg.ELINK_BATCH_SIZE]))
     elapsed = time.perf_counter() - t0
-    _api_log.info("op=elink status=%d pmc_hits=%d/%d duration=%.2fs", resp.status_code, len(result), len(pmids), elapsed)
+    _api_log.info("op=elink pmc_hits=%d/%d duration=%.2fs", len(result), len(pmids), elapsed)
     return result
 
 

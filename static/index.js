@@ -31,10 +31,10 @@ function updateCount() {
 }
 
 simSlider?.addEventListener('input', function () {
-  const threshold = parseInt(this.value);
+  const threshold = Number.parseInt(this.value);
   sliderVal.textContent = threshold + '%';
   reviewItems.forEach(item => {
-    const filtered = parseInt(item.dataset.sim) < threshold;
+    const filtered = Number.parseInt(item.dataset.sim) < threshold;
     item.classList.toggle('filtered', filtered);
     item.querySelector('.art-check').checked = !filtered;
   });
@@ -63,124 +63,132 @@ const embedProgress     = document.getElementById('embed-progress');
 const embedProgressBar  = document.getElementById('embed-progress-bar');
 const embedProgressText = document.getElementById('embed-progress-text');
 
-if (btnSave) {
-  btnSave.addEventListener('click', async () => {
-    const name = colName.value.trim();
-    if (!name) { colName.focus(); return; }
-
-    const selectedPmids = new Set();
-    reviewItems.forEach(item => {
-      if (!item.classList.contains('filtered') && item.querySelector('.art-check').checked)
-        selectedPmids.add(item.dataset.pmid);
-    });
-    const selectedArticles = ARTICLES.filter(a => selectedPmids.has(a.pmid));
-    if (!selectedArticles.length) {
-      saveStatus.className = 'err';
-      saveStatus.textContent = 'Select at least one article.';
-      return;
-    }
-
-    btnSave.disabled = true;
-    btnSave.textContent = 'Saving…';
-    saveStatus.className = '';
-    saveStatus.textContent = '';
-
-    embedProgress.style.display = 'block';
-    embedProgressBar.classList.remove('complete');
-    embedProgressBar.style.width = '0%';
-    embedProgressText.textContent = 'Starting…';
-
-    bar.style.display = 'block';
-    bar.style.transition = 'none';
-    bar.style.width = '0%';
-    requestAnimationFrame(() => Progress.set(10, 300));
-
-    try {
-      const res = await fetch('/collections/save-stream', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name,
-          user_query: USER_QUERY,
-          pubmed_query: PUBMED_QUERY,
-          articles: selectedArticles,
-        }),
-      });
-
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.error || `Server error ${res.status}`);
-      }
-
-      const reader  = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop();
-
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          const evt = JSON.parse(line.slice(6));
-
-          if (evt.type === 'fetch') {
-            const pct = Math.round((evt.done / evt.total) * 65) + 5;
-            Progress.set(pct, 150);
-            embedProgressBar.style.width = `${Math.round(evt.done / evt.total * 80)}%`;
-            let txt = `Fetching ${evt.done} / ${evt.total}`;
-            if (evt.full_text || evt.abstract || evt.fallback) {
-              const parts = [];
-              if (evt.full_text)  parts.push(`${evt.full_text} full text`);
-              if (evt.abstract)   parts.push(`${evt.abstract} abstract`);
-              if (evt.fallback)   parts.push(`${evt.fallback} fallback`);
-              txt += ` · ${parts.join(' · ')}`;
-            }
-            embedProgressText.textContent = txt;
-            btnSave.textContent = `Fetching… ${evt.done} / ${evt.total}`;
-
-          } else if (evt.type === 'embedding') {
-            Progress.set(78, 200);
-            embedProgressBar.style.width = '88%';
-            embedProgressText.textContent =
-              `Embedding ${evt.count} articles (${evt.full_text} full text · ${evt.abstract} abstract)…`;
-            btnSave.textContent = 'Embedding…';
-
-          } else if (evt.type === 'done') {
-            Progress.set(95, 200);
-            setTimeout(() => Progress.done(), 300);
-            embedProgressBar.style.width = '100%';
-            embedProgressBar.classList.add('complete');
-            const parts = [];
-            if (evt.full_text)  parts.push(`${evt.full_text} full text`);
-            if (evt.abstract)   parts.push(`${evt.abstract} abstract`);
-            if (evt.fallback)   parts.push(`${evt.fallback} fallback`);
-            const summary = parts.length ? ` (${parts.join(' · ')})` : '';
-            embedProgressText.textContent = `Done — ${evt.count} articles embedded${summary}`;
-            saveStatus.className = 'ok';
-            saveStatus.innerHTML =
-              `Saved! ${evt.count} articles embedded${summary}. ` +
-              `<a href="/collections/${evt.id}">Open collection &rarr;</a>`;
-            btnSave.textContent = 'Saved';
-
-          } else if (evt.type === 'error') {
-            throw new Error(evt.message);
-          }
-        }
-      }
-    } catch (err) {
-      Progress.error();
-      embedProgress.style.display = 'none';
-      saveStatus.className = 'err';
-      saveStatus.textContent = 'Error: ' + err.message;
-      btnSave.disabled = false;
-      btnSave.textContent = 'Save as RAG Collection';
-    }
-  });
+function _getSelectedArticles() {
+  const selectedPmids = new Set(
+    [...reviewItems]
+      .filter(item => !item.classList.contains('filtered') && item.querySelector('.art-check').checked)
+      .map(item => item.dataset.pmid)
+  );
+  return ARTICLES.filter(a => selectedPmids.has(a.pmid));
 }
+
+function _buildSourceSummary(evt) {
+  const parts = [];
+  if (evt.full_text) parts.push(`${evt.full_text} full text`);
+  if (evt.abstract)  parts.push(`${evt.abstract} abstract`);
+  if (evt.fallback)  parts.push(`${evt.fallback} fallback`);
+  return parts.join(' · ');
+}
+
+function _initSaveUI() {
+  btnSave.disabled = true;
+  btnSave.textContent = 'Saving…';
+  saveStatus.className = '';
+  saveStatus.textContent = '';
+  embedProgress.style.display = 'block';
+  embedProgressBar.classList.remove('complete');
+  embedProgressBar.style.width = '0%';
+  embedProgressText.textContent = 'Starting…';
+  bar.style.display = 'block';
+  bar.style.transition = 'none';
+  bar.style.width = '0%';
+  requestAnimationFrame(() => Progress.set(10, 300));
+}
+
+function _onFetchEvent(evt) {
+  const pct = Math.round((evt.done / evt.total) * 65) + 5;
+  Progress.set(pct, 150);
+  embedProgressBar.style.width = `${Math.round(evt.done / evt.total * 80)}%`;
+  const summary = _buildSourceSummary(evt);
+  embedProgressText.textContent = `Fetching ${evt.done} / ${evt.total}${summary ? ` · ${summary}` : ''}`;
+  btnSave.textContent = `Fetching… ${evt.done} / ${evt.total}`;
+}
+
+function _onEmbeddingEvent(evt) {
+  Progress.set(78, 200);
+  embedProgressBar.style.width = '88%';
+  embedProgressText.textContent =
+    `Embedding ${evt.count} articles (${evt.full_text} full text · ${evt.abstract} abstract)…`;
+  btnSave.textContent = 'Embedding…';
+}
+
+function _onDoneEvent(evt) {
+  Progress.set(95, 200);
+  setTimeout(() => Progress.done(), 300);
+  embedProgressBar.style.width = '100%';
+  embedProgressBar.classList.add('complete');
+  const summary = _buildSourceSummary(evt);
+  const summaryText = summary ? ` (${summary})` : '';
+  embedProgressText.textContent = `Done — ${evt.count} articles embedded${summaryText}`;
+  saveStatus.className = 'ok';
+  saveStatus.innerHTML =
+    `Saved! ${evt.count} articles embedded${summaryText}. ` +
+    `<a href="/collections/${evt.id}">Open collection &rarr;</a>`;
+  btnSave.textContent = 'Saved';
+}
+
+async function* _readSaveLines(res) {
+  const reader  = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer    = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop();
+    for (const line of lines) {
+      if (line.startsWith('data: ')) yield line;
+    }
+  }
+}
+
+async function _dispatchSaveEvents(res) {
+  for await (const line of _readSaveLines(res)) {
+    const evt = JSON.parse(line.slice(6));
+    if (evt.type === 'fetch')     { _onFetchEvent(evt); continue; }
+    if (evt.type === 'embedding') { _onEmbeddingEvent(evt); continue; }
+    if (evt.type === 'done')      { _onDoneEvent(evt); continue; }
+    if (evt.type === 'error')     throw new Error(evt.message);
+  }
+}
+
+// ── Save ──────────────────────────────────────────────────────────────────────────────
+async function saveCollection() {
+  const name = colName.value.trim();
+  if (!name) { colName.focus(); return; }
+
+  const selectedArticles = _getSelectedArticles();
+  if (!selectedArticles.length) {
+    saveStatus.className = 'err';
+    saveStatus.textContent = 'Select at least one article.';
+    return;
+  }
+
+  _initSaveUI();
+
+  try {
+    const res = await fetch('/collections/save-stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, user_query: USER_QUERY, pubmed_query: PUBMED_QUERY, articles: selectedArticles }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || `Server error ${res.status}`);
+    }
+    await _dispatchSaveEvents(res);
+  } catch (err) {
+    Progress.error();
+    embedProgress.style.display = 'none';
+    saveStatus.className = 'err';
+    saveStatus.textContent = 'Error: ' + err.message;
+    btnSave.disabled = false;
+    btnSave.textContent = 'Save as RAG Collection';
+  }
+}
+
+if (btnSave) btnSave.addEventListener('click', saveCollection);
 
 // ── Search form progress ──────────────────────────────────────────────────────
 const form    = document.querySelector('form');

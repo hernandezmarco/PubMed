@@ -66,7 +66,9 @@ NCBI_BACKOFF_MAX = 30.0   # seconds; cap on exponential back-off delay
 
 TIMEOUT_ESEARCH      = 10
 TIMEOUT_EFETCH       = 15
+TIMEOUT_ELINK        = 30
 TIMEOUT_PMC_FULLTEXT = 30
+ELINK_BATCH_SIZE     = 50
 
 # ── Search / retrieval ────────────────────────────────────────────────────────
 
@@ -74,6 +76,17 @@ MAX_RESULTS_DEFAULT = 25
 MAX_RESULTS_MIN     = 25
 MAX_RESULTS_MAX     = 200
 SEMANTIC_SEARCH_K   = 5   # top-k chunks retrieved per RAG query
+
+# ── Embedding ────────────────────────────────────────────────────────────────
+# EMBED_THREADS caps the ONNX Runtime thread pool — the primary lever for
+# preventing CPU spikes in memory-constrained containers. Set to 1 to keep
+# CPU usage flat; raise to 2-4 if the host has spare cores.
+# EMBED_BATCH_SIZE controls texts per ONNX forward pass (default upstream: 256).
+# Lowering it reduces peak memory and smooths CPU load at the cost of
+# slightly longer total embedding time.
+
+EMBED_THREADS    = int(os.environ.get("EMBED_THREADS",    "1"))
+EMBED_BATCH_SIZE = int(os.environ.get("EMBED_BATCH_SIZE", "32"))
 
 # ── Text chunking ─────────────────────────────────────────────────────────────
 

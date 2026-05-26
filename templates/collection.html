@@ -108,5 +108,5 @@
 const COLLECTION_ID = {{ collection.id }};
 </script>
 <script src="https://cdn.jsdelivr.net/npm/marked@9/marked.min.js"></script>
-<script src="{{ url_for('static', filename='collection.js') }}?v={{ static_version }}"></script>
+<script type="module" src="{{ url_for('static', filename='collection.js') }}?v={{ static_version }}"></script>
 {% endblock %}

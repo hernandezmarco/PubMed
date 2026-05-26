@@ -56,14 +56,14 @@ document.addEventListener('click', () => exportDropdown.classList.remove('open')
 
 document.getElementById('export-docx').addEventListener('click', () => {
   if (currentConversationId) {
-    window.location.href = `/conversations/${currentConversationId}/export?format=docx`;
+    globalThis.location.href = `/conversations/${currentConversationId}/export?format=docx`;
   }
   exportDropdown.classList.remove('open');
 });
 
 document.getElementById('export-rtf').addEventListener('click', () => {
   if (currentConversationId) {
-    window.location.href = `/conversations/${currentConversationId}/export?format=rtf`;
+    globalThis.location.href = `/conversations/${currentConversationId}/export?format=rtf`;
   }
   exportDropdown.classList.remove('open');
 });
@@ -78,10 +78,10 @@ const stepEls   = {
 // ── Utilities ─────────────────────────────────────────────────────────────────
 function escapeHtml(str) {
   return str
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;');
 }
 
 function formatDate(isoStr) {
@@ -112,9 +112,9 @@ function clearSteps() {
 
 // ── Citation linking ──────────────────────────────────────────────────────────
 function linkifyCitations(el, citations) {
-  if (!citations || !citations.length) return;
+  if (!citations?.length) return;
   const urlMap = {};
-  citations.forEach((c, i) => { urlMap[c.num !== undefined ? c.num : i + 1] = c.url; });
+  citations.forEach((c, i) => { urlMap[c.num ?? i + 1] = c.url; });
 
   // Walk text nodes so we never corrupt HTML attribute values or tag names
   const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
@@ -126,8 +126,8 @@ function linkifyCitations(el, citations) {
   nodes.forEach(textNode => {
     const frag = document.createDocumentFragment();
     textNode.textContent.split(/(\[\d+\])/).forEach(part => {
-      const m = part.match(/^\[(\d+)\]$/);
-      const url = m && urlMap[parseInt(m[1])];
+      const m = /^\[(\d+)\]$/.exec(part);
+      const url = m && urlMap[Number.parseInt(m[1])];
       if (url) {
         const sup = document.createElement('sup');
         const a   = document.createElement('a');
@@ -166,7 +166,7 @@ function appendAssistantMsg() {
 }
 
 function renderSuggestions(questions) {
-  if (!questions || !questions.length) return null;
+  if (  !questions?.length) return null;
   const row = document.createElement('div');
   row.className = 'suggestions-row';
   questions.forEach(q => {
@@ -209,7 +209,7 @@ function finalizeMsgWithCitations(msgEl, citations, suggestions, usage) {
     citDiv.innerHTML = '<div class="citations-label">Sources retrieved</div>';
 
     citations.forEach((art, i) => {
-      const num  = art.num !== undefined ? art.num : i + 1;
+      const num  = art.num ?? i + 1;
       const item = document.createElement('div');
       item.className = 'citation-item';
       item.innerHTML =
@@ -302,7 +302,7 @@ async function loadConversation(vid) {
 
   // Update active highlight in sidebar
   document.querySelectorAll('.conv-item').forEach(el => {
-    el.classList.toggle('active', parseInt(el.dataset.id) === vid);
+    el.classList.toggle('active', Number.parseInt(el.dataset.id) === vid);
   });
 
   try {
@@ -325,7 +325,7 @@ async function loadConversation(vid) {
         const ansEl = document.createElement('span');
         ansEl.className = 'answer';
         ansEl.innerHTML = marked.parse(msg.content);
-        if (msg.citations && msg.citations.length) {
+        if (msg.citations?.length) {
           linkifyCitations(ansEl, msg.citations);
         }
         el.appendChild(ansEl);
@@ -364,98 +364,97 @@ function newConversation() {
 
 btnNewChat.addEventListener('click', newConversation);
 
+// ── Ask helpers ───────────────────────────────────────────────────────────────
+function _initAsk() {
+  questionInput.value = '';
+  btnAsk.disabled = true;
+  btnAsk.textContent = '…';
+  document.querySelectorAll('.art-item.highlighted').forEach(el => el.classList.remove('highlighted'));
+  Progress.start(12, 60);
+  setStep('embed');
+}
+
+function _showAskError(answerEl, msgEl, message) {
+  answerEl.textContent = 'Error: ' + message;
+  msgEl.querySelector('.typing-cursor')?.remove();
+  Progress.error();
+  clearSteps();
+}
+
+async function _postQuestion(question) {
+  const res = await fetch(`/collections/${COLLECTION_ID}/ask`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ question, model: modelSelect.value, conversation_id: currentConversationId }),
+  });
+  setStep('search');
+  Progress.set(40, 300);
+  return res;
+}
+
+async function* _readSSELines(res) {
+  const reader  = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer    = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n\n');
+    buffer = lines.pop();
+    for (const line of lines) {
+      if (line.startsWith('data: ')) yield line;
+    }
+  }
+}
+
+function _onTextToken(text, state, answerEl) {
+  if (!state.firstToken) { state.firstToken = true; setStep('generate'); Progress.set(55, 200); }
+  state.rawAnswer += text;
+  answerEl.innerHTML = marked.parse(state.rawAnswer);
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+async function _onDonePayload(payload, msgEl, wasNewConversation) {
+  currentConversationId = payload.conversation_id;
+  chatToolbar.classList.add('visible');
+  finalizeMsgWithCitations(msgEl, payload.citations || [], payload.suggestions || [], payload.usage || null);
+  Progress.done();
+  clearSteps();
+  if (wasNewConversation) await refreshConversationList();
+}
+
+async function _consumeStream(res, answerEl, msgEl, wasNewConversation) {
+  const state = { rawAnswer: '', firstToken: false };
+  for await (const line of _readSSELines(res)) {
+    const payload = JSON.parse(line.slice(6));
+    if (payload.error) { _showAskError(answerEl, msgEl, payload.error); return; }
+    if (payload.text)  _onTextToken(payload.text, state, answerEl);
+    if (payload.done)  await _onDonePayload(payload, msgEl, wasNewConversation);
+  }
+}
+
 // ── Ask ───────────────────────────────────────────────────────────────────────
 async function ask() {
   const question = questionInput.value.trim();
   if (!question) return;
 
-  questionInput.value = '';
-  btnAsk.disabled = true;
-  btnAsk.textContent = '…';
-
-  document.querySelectorAll('.art-item.highlighted')
-    .forEach(el => el.classList.remove('highlighted'));
-
+  _initAsk();
   appendUserMsg(question);
   const msgEl    = appendAssistantMsg();
   const answerEl = msgEl.querySelector('.answer');
-  let rawAnswer  = '';
-  let firstToken = false;
-
-  Progress.start(12, 60);
-  setStep('embed');
-
   const wasNewConversation = currentConversationId === null;
 
   try {
-    const res = await fetch(`/collections/${COLLECTION_ID}/ask`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        question,
-        model: modelSelect.value,
-        conversation_id: currentConversationId,
-      }),
-    });
-
-    setStep('search');
-    Progress.set(40, 300);
-
-    const reader  = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer    = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n\n');
-      buffer = lines.pop();
-
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const payload = JSON.parse(line.slice(6));
-        if (payload.error) {
-          answerEl.textContent = 'Error: ' + payload.error;
-          msgEl.querySelector('.typing-cursor')?.remove();
-          Progress.error();
-          clearSteps();
-          btnAsk.disabled = false;
-          btnAsk.textContent = 'Ask';
-          return;
-        }
-        if (payload.text) {
-          if (!firstToken) {
-            firstToken = true;
-            setStep('generate');
-            Progress.set(55, 200);
-          }
-          rawAnswer += payload.text;
-          answerEl.innerHTML = marked.parse(rawAnswer);
-          chatMessages.scrollTop = chatMessages.scrollHeight;
-        }
-        if (payload.done) {
-          currentConversationId = payload.conversation_id;
-          chatToolbar.classList.add('visible');
-          finalizeMsgWithCitations(msgEl, payload.citations || [], payload.suggestions || [], payload.usage || null);
-          Progress.done();
-          clearSteps();
-
-          // Refresh sidebar when a new conversation was created
-          if (wasNewConversation) await refreshConversationList();
-        }
-      }
-    }
+    const res = await _postQuestion(question);
+    await _consumeStream(res, answerEl, msgEl, wasNewConversation);
   } catch (err) {
-    answerEl.textContent = 'Error: ' + err.message;
-    msgEl.querySelector('.typing-cursor')?.remove();
-    Progress.error();
-    clearSteps();
+    _showAskError(answerEl, msgEl, err.message);
+  } finally {
+    btnAsk.disabled = false;
+    btnAsk.textContent = 'Ask';
+    chatMessages.scrollTop = chatMessages.scrollHeight;
   }
-
-  btnAsk.disabled = false;
-  btnAsk.textContent = 'Ask';
-  chatMessages.scrollTop = chatMessages.scrollHeight;
 }
 
 btnAsk.addEventListener('click', ask);
@@ -535,10 +534,10 @@ async function loadStarterQuestions() {
       loading.remove();
     }
   } catch (err) {
+    console.error('Failed to load starter questions:', err);
     document.getElementById('starter-loading')?.remove();
   }
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
-loadConversations();
-loadStarterQuestions();
+await Promise.all([loadConversations(), loadStarterQuestions()]);

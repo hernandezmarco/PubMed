@@ -234,7 +234,7 @@
 .save-controls-row input[type="text"]:focus { border-color: #0f3460; }
 
 .btn-save {
-  background: #27ae60;
+  background: #15803d;
   color: #fff;
   border: none;
   padding: 0.5rem 1.1rem;
@@ -245,7 +245,7 @@
   white-space: nowrap;
   transition: background .2s;
 }
-.btn-save:hover    { background: #219150; }
+.btn-save:hover    { background: #166534; }
 .btn-save:disabled { opacity: .6; cursor: not-allowed; }
 #save-status       { font-size: 0.85rem; }
 #save-status.ok    { color: #27ae60; }

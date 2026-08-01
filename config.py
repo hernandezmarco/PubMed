@@ -22,37 +22,64 @@ so that different deployments can swap models without a code change.
 
 import os
 
+# ── Provider credentials ──────────────────────────────────────────────────────
+
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY",    "")
+OLLAMA_BASE_URL   = os.getenv("OLLAMA_BASE_URL",   "http://localhost:11434")
+
 # ── Models ────────────────────────────────────────────────────────────────────
 
 QUERY_BUILDER_MODEL     = os.getenv("QUERY_BUILDER_MODEL",     "claude-opus-4-6")
 STARTER_QUESTIONS_MODEL = os.getenv("STARTER_QUESTIONS_MODEL", "claude-opus-4-6")
 DEFAULT_CHAT_MODEL      = os.getenv("DEFAULT_CHAT_MODEL",      "claude-opus-4-6")
-ALLOWED_CHAT_MODELS     = {
-    "claude-opus-4-6",
-    "claude-sonnet-4-6",
-    "claude-haiku-4-5-20251001",
-}
 
-EMBEDDING_MODEL         = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
 
-# ── Pricing (Anthropic list prices, USD per million tokens) ───────────────────
-
-MODEL_PRICING: dict[str, dict[str, float]] = {
-    "claude-opus-4-6":           {"input": 15.00, "output": 75.00},
-    "claude-sonnet-4-6":         {"input":  3.00, "output": 15.00},
-    "claude-haiku-4-5-20251001": {"input":  0.80, "output":  4.00},
-}
-
-# Short display names shown to users in the UI
-MODEL_SHORT_NAMES: dict[str, str] = {
-    "claude-opus-4-6":           "Opus 4.6",
-    "claude-sonnet-4-6":         "Sonnet 4.6",
-    "claude-haiku-4-5-20251001": "Haiku 4.5",
+# All chat models available for selection. Entries whose requires_key env var is
+# not set at startup are hidden from the UI. Ollama models are appended at
+# runtime via dynamic discovery (see app.py:available_chat_models).
+CHAT_MODELS: dict[str, dict] = {
+    "claude-opus-4-6": {
+        "display":      "Opus 4.6",
+        "provider":     "anthropic",
+        "requires_key": "ANTHROPIC_API_KEY",
+        "input_price":  15.00,
+        "output_price": 75.00,
+    },
+    "claude-sonnet-4-6": {
+        "display":      "Sonnet 4.6",
+        "provider":     "anthropic",
+        "requires_key": "ANTHROPIC_API_KEY",
+        "input_price":   3.00,
+        "output_price": 15.00,
+    },
+    "claude-haiku-4-5-20251001": {
+        "display":      "Haiku 4.5",
+        "provider":     "anthropic",
+        "requires_key": "ANTHROPIC_API_KEY",
+        "input_price":   0.80,
+        "output_price":  4.00,
+    },
+    "gpt-4o": {
+        "display":      "GPT-4o",
+        "provider":     "openai",
+        "requires_key": "OPENAI_API_KEY",
+        "input_price":   2.50,
+        "output_price": 10.00,
+    },
+    "o3": {
+        "display":      "o3",
+        "provider":     "openai",
+        "requires_key": "OPENAI_API_KEY",
+        "input_price":  10.00,
+        "output_price": 40.00,
+    },
 }
 
 # ── Generation limits (tokens) ────────────────────────────────────────────────
 
-MAX_TOKENS_PUBMED_QUERY = 512
+MAX_TOKENS_PUBMED_QUERY = 1536   # 512 budget_tokens for thinking + ~1k for output
 MAX_TOKENS_STARTER_QS   = 256
 MAX_TOKENS_RAG_RESPONSE = 2560
 

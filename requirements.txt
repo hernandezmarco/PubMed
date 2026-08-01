@@ -1,4 +1,4 @@
-anthropic
+litellm
 flask
 requests
 python-dotenv

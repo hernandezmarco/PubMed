@@ -24,14 +24,14 @@ import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import anthropic
+import litellm
 import numpy as np
 import requests
 from docx import Document
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import RGBColor
-from flask import Flask, Response, render_template, request, stream_with_context
+from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 from dotenv import load_dotenv
 
 import db
@@ -80,7 +80,44 @@ _SSE_MIMETYPE = "text/event-stream"
 
 app = Flask(__name__)
 app.jinja_env.globals["static_version"] = cfg.STATIC_VERSION
-client = anthropic.Anthropic()
+
+# ── Available models (resolved once at first request) ─────────────────────────
+
+_available_models_cache: dict[str, dict] | None = None
+
+
+def _discover_ollama_models() -> dict[str, dict]:
+    try:
+        resp = requests.get(f"{cfg.OLLAMA_BASE_URL}/api/tags", timeout=2)
+        if resp.status_code != 200:
+            return {}
+        return {
+            f"ollama/{m['name']}": {
+                "display":      m["name"],
+                "provider":     "ollama",
+                "requires_key": "",
+                "input_price":  0.0,
+                "output_price": 0.0,
+            }
+            for m in resp.json().get("models", [])
+        }
+    except Exception:
+        return {}
+
+
+def available_chat_models() -> dict[str, dict]:
+    global _available_models_cache
+    if _available_models_cache is None:
+        result = {
+            mid: meta
+            for mid, meta in cfg.CHAT_MODELS.items()
+            if os.getenv(meta.get("requires_key", ""), "")
+        }
+        result.update(_discover_ollama_models())
+        _available_models_cache = result
+        _log.info("Available chat models: %s", list(result))
+    return _available_models_cache
+
 
 # ── Embeddings ────────────────────────────────────────────────────────────────
 
@@ -132,20 +169,24 @@ def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> list[st
 def build_pubmed_query(english_query: str) -> str:
     _claude_log.debug("op=build_query query=%r", english_query[:120])
     t0 = time.perf_counter()
-    with client.messages.stream(
+    response = litellm.completion(
         model=cfg.QUERY_BUILDER_MODEL,
         max_tokens=cfg.MAX_TOKENS_PUBMED_QUERY,
-        thinking={"type": "adaptive"},
-        system=cfg.PROMPT_PUBMED_QUERY,
-        messages=[{"role": "user", "content": english_query}],
-    ) as stream:
-        msg = stream.get_final_message()
-        text_block = next(b for b in msg.content if b.type == "text")
-        result = text_block.text.strip()
+        thinking={"type": "enabled", "budget_tokens": 512},
+        messages=[
+            {"role": "system", "content": cfg.PROMPT_PUBMED_QUERY},
+            {"role": "user",   "content": english_query},
+        ],
+    )
+    result = (response.choices[0].message.content or "").strip()
     elapsed = time.perf_counter() - t0
+    usage = response.usage
     _claude_log.info(
         "op=build_query model=%s in_tokens=%d out_tokens=%d duration=%.2fs",
-        cfg.QUERY_BUILDER_MODEL, msg.usage.input_tokens, msg.usage.output_tokens, elapsed,
+        cfg.QUERY_BUILDER_MODEL,
+        getattr(usage, "prompt_tokens", 0),
+        getattr(usage, "completion_tokens", 0),
+        elapsed,
     )
     _claude_log.debug("op=build_query result=%r", result)
     return result
@@ -311,7 +352,6 @@ def _extract_pmcid(linkset: dict) -> tuple[str, str] | None:
         if lsdb.get("linkname") == "pubmed_pmc" and lsdb.get("links"):
             return pmid, str(lsdb["links"][0])
     return None
-
 
 def _fetch_pmcid_batch(batch: list[str]) -> dict[str, str]:
     resp = _ncbi_post(

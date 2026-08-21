@@ -28,20 +28,65 @@ const exportDropdown = document.getElementById('export-dropdown');
 let currentConversationId = null;
 let starterQuestions = [];
 
-// ── Model display names ───────────────────────────────────────────────────────
-const MODEL_NAMES = {
-  'claude-opus-4-6':           'Opus 4.6',
-  'claude-sonnet-4-6':         'Sonnet 4.6',
-  'claude-haiku-4-5-20251001': 'Haiku 4.5',
-};
+// ── Model display names (populated by loadModels) ──────────────────────────────
+let MODEL_NAMES = {};
 
 // ── Model persistence ─────────────────────────────────────────────────────────
 const MODEL_KEY = 'pubmed_selected_model';
-const savedModel = localStorage.getItem(MODEL_KEY);
-if (savedModel) {
-  const opt = modelSelect.querySelector(`option[value="${savedModel}"]`);
-  if (opt) modelSelect.value = savedModel;
+
+const PROVIDER_LABELS = {
+  anthropic: 'Anthropic',
+  openai: 'OpenAI',
+  ollama: 'Ollama (local)',
+  'ollama-cloud': 'Ollama (cloud)',
+};
+
+async function loadModels() {
+  try {
+    const res  = await fetch('/api/models');
+    const data = await res.json();
+    const models = data.models || [];
+
+    MODEL_NAMES = {};
+    modelSelect.innerHTML = '';
+
+    const byProvider = new Map();
+    for (const m of models) {
+      MODEL_NAMES[m.id] = m.display;
+      if (!byProvider.has(m.provider)) byProvider.set(m.provider, []);
+      byProvider.get(m.provider).push(m);
+    }
+    for (const [provider, group] of byProvider) {
+      const optgroup = document.createElement('optgroup');
+      optgroup.label = PROVIDER_LABELS[provider] || provider;
+      for (const m of group) {
+        const opt = document.createElement('option');
+        opt.value = m.id;
+        opt.textContent = m.display;
+        optgroup.appendChild(opt);
+      }
+      modelSelect.appendChild(optgroup);
+    }
+
+    if (!models.length) {
+      btnAsk.disabled = true;
+      btnAsk.title = 'No chat models available — check ANTHROPIC_API_KEY / OLLAMA_BASE_URL / OLLAMA_API_KEY.';
+      return;
+    }
+
+    const savedModel = localStorage.getItem(MODEL_KEY);
+    if (savedModel && MODEL_NAMES[savedModel]) {
+      modelSelect.value = savedModel;
+    } else if (data.default && MODEL_NAMES[data.default]) {
+      modelSelect.value = data.default;
+    }
+  } catch (err) {
+    console.error('Failed to load models:', err);
+    btnAsk.disabled = true;
+    btnAsk.title = 'Failed to load chat models.';
+  }
 }
+
 modelSelect.addEventListener('change', () => {
   localStorage.setItem(MODEL_KEY, modelSelect.value);
 });
@@ -540,4 +585,4 @@ async function loadStarterQuestions() {
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
-await Promise.all([loadConversations(), loadStarterQuestions()]);
+await Promise.all([loadModels(), loadConversations(), loadStarterQuestions()]);

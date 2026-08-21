@@ -22,39 +22,74 @@ so that different deployments can swap models without a code change.
 
 import os
 
+# ── Provider credentials ──────────────────────────────────────────────────────
+
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY",    "")
+OLLAMA_BASE_URL   = os.getenv("OLLAMA_BASE_URL",   "http://localhost:11434")
+OLLAMA_API_KEY    = os.getenv("OLLAMA_API_KEY",    "")
+
+# Fixed — not user-configurable like OLLAMA_BASE_URL. Ollama Cloud requires
+# streaming chat requests (non-streaming calls return 401 Unauthorized).
+OLLAMA_CLOUD_BASE_URL = "https://ollama.com"
+
 # ── Models ────────────────────────────────────────────────────────────────────
 
 QUERY_BUILDER_MODEL     = os.getenv("QUERY_BUILDER_MODEL",     "claude-opus-4-6")
 STARTER_QUESTIONS_MODEL = os.getenv("STARTER_QUESTIONS_MODEL", "claude-opus-4-6")
 DEFAULT_CHAT_MODEL      = os.getenv("DEFAULT_CHAT_MODEL",      "claude-opus-4-6")
-ALLOWED_CHAT_MODELS     = {
-    "claude-opus-4-6",
-    "claude-sonnet-4-6",
-    "claude-haiku-4-5-20251001",
-}
 
-EMBEDDING_MODEL         = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
 
-# ── Pricing (Anthropic list prices, USD per million tokens) ───────────────────
-
-MODEL_PRICING: dict[str, dict[str, float]] = {
-    "claude-opus-4-6":           {"input": 15.00, "output": 75.00},
-    "claude-sonnet-4-6":         {"input":  3.00, "output": 15.00},
-    "claude-haiku-4-5-20251001": {"input":  0.80, "output":  4.00},
-}
-
-# Short display names shown to users in the UI
-MODEL_SHORT_NAMES: dict[str, str] = {
-    "claude-opus-4-6":           "Opus 4.6",
-    "claude-sonnet-4-6":         "Sonnet 4.6",
-    "claude-haiku-4-5-20251001": "Haiku 4.5",
+# All chat models available for selection. Entries whose requires_key env var is
+# not set at startup are hidden from the UI. Ollama models are appended at
+# runtime via dynamic discovery (see app.py:available_chat_models).
+CHAT_MODELS: dict[str, dict] = {
+    "claude-opus-4-6": {
+        "display":      "Opus 4.6",
+        "provider":     "anthropic",
+        "requires_key": "ANTHROPIC_API_KEY",
+        "input_price":  15.00,
+        "output_price": 75.00,
+    },
+    "claude-sonnet-4-6": {
+        "display":      "Sonnet 4.6",
+        "provider":     "anthropic",
+        "requires_key": "ANTHROPIC_API_KEY",
+        "input_price":   3.00,
+        "output_price": 15.00,
+    },
+    "claude-haiku-4-5-20251001": {
+        "display":      "Haiku 4.5",
+        "provider":     "anthropic",
+        "requires_key": "ANTHROPIC_API_KEY",
+        "input_price":   0.80,
+        "output_price":  4.00,
+    },
+    "gpt-4o": {
+        "display":      "GPT-4o",
+        "provider":     "openai",
+        "requires_key": "OPENAI_API_KEY",
+        "input_price":   2.50,
+        "output_price": 10.00,
+    },
+    "o3": {
+        "display":      "o3",
+        "provider":     "openai",
+        "requires_key": "OPENAI_API_KEY",
+        "input_price":  10.00,
+        "output_price": 40.00,
+    },
 }
 
 # ── Generation limits (tokens) ────────────────────────────────────────────────
 
-MAX_TOKENS_PUBMED_QUERY = 512
+MAX_TOKENS_PUBMED_QUERY = 1536   # 1024 budget_tokens for thinking + ~512 for output
 MAX_TOKENS_STARTER_QS   = 256
-MAX_TOKENS_RAG_RESPONSE = 2560
+MAX_TOKENS_RAG_RESPONSE = 4096
+
+# Anthropic requires thinking.budget_tokens >= 1024 and < max_tokens.
+PUBMED_QUERY_THINKING_BUDGET = 1024
 
 # ── NCBI / PubMed ─────────────────────────────────────────────────────────────
 
@@ -123,7 +158,9 @@ PROMPT_STARTER_QUESTIONS = (
 PROMPT_RAG_SYSTEM = (
     "You are a biomedical research assistant. Answer the user's question using "
     "ONLY the numbered article excerpts provided. Cite sources inline as [1], [2], etc. "
-    "Be concise and precise. If the excerpts lack sufficient information, say so.\n\n"
+    "Be as thorough and detailed as possible: explain mechanisms, report specific findings, "
+    "numbers, and comparisons from the excerpts, and synthesize across multiple sources rather "
+    "than giving a brief summary. If the excerpts lack sufficient information, say so.\n\n"
     "After your answer output a line containing only === followed immediately by a "
     "JSON array of exactly 4 concise follow-up questions the user might ask next, "
     "based on your answer. Example:\n"

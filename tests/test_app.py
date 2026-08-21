@@ -20,7 +20,7 @@ import json
 import xml.etree.ElementTree as ET
 from unittest.mock import MagicMock, patch
 
-import anthropic
+import litellm
 import numpy as np
 import pytest
 import requests
@@ -36,6 +36,15 @@ sys.modules.setdefault("fastembed", fastembed_stub)
 
 import app as _app  # noqa: E402  (must come after stubs)
 import config as cfg
+
+
+@pytest.fixture(autouse=True)
+def _no_ollama_discovery():
+    """Prevent real network calls to a local Ollama server during the test suite."""
+    _app._available_models_cache = None
+    with patch("app._discover_ollama_models", return_value={}):
+        yield
+    _app._available_models_cache = None
 
 
 class TestCosineSimilarity:
@@ -267,7 +276,7 @@ class TestComputeCost:
 
     def test_output_weighted_more_than_input(self):
         # For every model, output tokens cost more than input tokens
-        for model in cfg.ALLOWED_CHAT_MODELS:
+        for model in cfg.CHAT_MODELS:
             cost_in  = _app._compute_cost(model, 1_000, 0)
             cost_out = _app._compute_cost(model, 0, 1_000)
             assert cost_out > cost_in, f"Output should cost more than input for {model}"
@@ -420,24 +429,27 @@ class TestExtractAnswerFromEvents:
 
 # ── Helpers shared by new test classes ───────────────────────────────────────
 
-def _make_stream_cm(text_tokens: list[str], query_text: str = "diabetes[MeSH]",
-                    in_tokens: int = 100, out_tokens: int = 50):
-    """Return a mock that behaves like client.messages.stream(...) as stream:"""
-    text_block = MagicMock()
-    text_block.type = "text"
-    text_block.text = query_text
+def _make_completion_response(text: str, in_tokens: int = 100, out_tokens: int = 50):
+    """Return a mock that behaves like litellm.completion(...) (non-streaming)."""
+    response = MagicMock()
+    response.choices = [MagicMock(message=MagicMock(content=text))]
+    response.usage = MagicMock(prompt_tokens=in_tokens, completion_tokens=out_tokens)
+    return response
 
-    final_msg = MagicMock()
-    final_msg.content = [text_block]
-    final_msg.usage.input_tokens = in_tokens
-    final_msg.usage.output_tokens = out_tokens
 
-    stream = MagicMock()
-    stream.text_stream = iter(text_tokens)
-    stream.get_final_message.return_value = final_msg
-    stream.__enter__ = MagicMock(return_value=stream)
-    stream.__exit__ = MagicMock(return_value=False)
-    return stream
+def _make_stream_chunks(text_tokens: list[str], in_tokens: int = 100, out_tokens: int = 50):
+    """Return an iterator mimicking litellm.completion(..., stream=True)."""
+    chunks = []
+    for token in text_tokens:
+        chunk = MagicMock()
+        chunk.choices = [MagicMock(delta=MagicMock(content=token))]
+        chunk.usage = None
+        chunks.append(chunk)
+    final_chunk = MagicMock()
+    final_chunk.choices = []
+    final_chunk.usage = MagicMock(prompt_tokens=in_tokens, completion_tokens=out_tokens)
+    chunks.append(final_chunk)
+    return iter(chunks)
 
 
 def _make_ncbi_resp(status_code: int = 200, json_data: dict | None = None,
@@ -467,32 +479,29 @@ class TestEmbedTexts:
             result = _app.embed_texts(["a", "b"])
         assert len(result) == 2
 
-    def test_get_embedder_caches_instance(self):
-        _app._embedder = None
+    def test_get_embedder_caches_instance(self, monkeypatch):
+        monkeypatch.setattr(_app, "_embedder", None)
         # fastembed is stubbed at the top of this file; TextEmbedding is a MagicMock
         e1 = _app.get_embedder()
         e2 = _app.get_embedder()
         assert e1 is e2
-        _app._embedder = None  # restore
 
 
 # ── build_pubmed_query ────────────────────────────────────────────────────────
 
 class TestBuildPubmedQuery:
     def test_returns_stripped_text(self):
-        stream_cm = _make_stream_cm([], query_text="  diabetes[MeSH]  ")
-        with patch("app.client") as mock_client:
-            mock_client.messages.stream.return_value = stream_cm
+        response = _make_completion_response("  diabetes[MeSH]  ")
+        with patch("app.litellm.completion", return_value=response):
             result = _app.build_pubmed_query("diabetes")
         assert result == "diabetes[MeSH]"
 
     def test_calls_claude_with_query(self):
-        stream_cm = _make_stream_cm([], query_text="result")
-        with patch("app.client") as mock_client:
-            mock_client.messages.stream.return_value = stream_cm
+        response = _make_completion_response("result")
+        with patch("app.litellm.completion", return_value=response) as mock_completion:
             _app.build_pubmed_query("my query")
-        call_kwargs = mock_client.messages.stream.call_args.kwargs
-        assert call_kwargs["messages"][0]["content"] == "my query"
+        call_kwargs = mock_completion.call_args.kwargs
+        assert call_kwargs["messages"][1]["content"] == "my query"
 
 
 # ── _ncbi_get retry logic ─────────────────────────────────────────────────────
@@ -785,12 +794,8 @@ class TestRunSearch:
 
     def test_auth_error_returns_message(self):
         with patch("app.build_pubmed_query",
-                   side_effect=anthropic.AuthenticationError.__new__(anthropic.AuthenticationError)):
-            pass  # tested via side_effect below
-        import anthropic as _anthropic
-        with patch("app.build_pubmed_query",
-                   side_effect=_anthropic.AuthenticationError(
-                       message="bad key", response=MagicMock(), body={})):
+                   side_effect=litellm.exceptions.AuthenticationError(
+                       message="bad key", llm_provider="anthropic", model="claude-opus-4-6")):
             results, _, err = _app._run_search("q", 25)
         assert results is None
         assert "API key" in err
@@ -854,28 +859,19 @@ class TestFetchArticleText:
 
 class TestGenerateStarterQuestions:
     def test_returns_questions_list(self):
-        mock_msg = MagicMock()
-        mock_msg.content[0].text = '["Q1?", "Q2?", "Q3?", "Q4?"]'
-        mock_msg.usage.input_tokens = 50
-        mock_msg.usage.output_tokens = 30
-        with patch("app.client") as mock_client:
-            mock_client.messages.create.return_value = mock_msg
+        response = _make_completion_response('["Q1?", "Q2?", "Q3?", "Q4?"]', in_tokens=50, out_tokens=30)
+        with patch("app.litellm.completion", return_value=response):
             result = _app.generate_starter_questions("diabetes", [{"title": "T"}])
         assert result == ["Q1?", "Q2?", "Q3?", "Q4?"]
 
     def test_truncates_to_four(self):
-        mock_msg = MagicMock()
-        mock_msg.content[0].text = '["Q1?","Q2?","Q3?","Q4?","Q5?"]'
-        mock_msg.usage.input_tokens = 50
-        mock_msg.usage.output_tokens = 30
-        with patch("app.client") as mock_client:
-            mock_client.messages.create.return_value = mock_msg
+        response = _make_completion_response('["Q1?","Q2?","Q3?","Q4?","Q5?"]', in_tokens=50, out_tokens=30)
+        with patch("app.litellm.completion", return_value=response):
             result = _app.generate_starter_questions("q", [])
         assert len(result) == 4
 
     def test_returns_empty_on_exception(self):
-        with patch("app.client") as mock_client:
-            mock_client.messages.create.side_effect = Exception("api down")
+        with patch("app.litellm.completion", side_effect=Exception("api down")):
             result = _app.generate_starter_questions("q", [])
         assert result == []
 
@@ -887,9 +883,8 @@ class TestStreamDelimitedResponse:
 
     def test_returns_events_post_and_usage(self):
         tokens = ["Answer text", self._DELIM, '["Q1?"]']
-        stream_cm = _make_stream_cm(tokens)
-        with patch("app.client") as mock_client:
-            mock_client.messages.stream.return_value = stream_cm
+        chunks = _make_stream_chunks(tokens)
+        with patch("app.litellm.completion", return_value=chunks):
             _, post, usage = _app._stream_delimited_response(
                 "claude-sonnet-4-6", "ctx", "question", self._DELIM, _app._sse_emit
             )
@@ -898,20 +893,19 @@ class TestStreamDelimitedResponse:
         assert "output_tokens" in usage
 
     def test_pre_text_emitted_when_no_delimiter(self):
-        stream_cm = _make_stream_cm(["Just an answer"])
-        with patch("app.client") as mock_client:
-            mock_client.messages.stream.return_value = stream_cm
+        chunks = _make_stream_chunks(["Just an answer"])
+        with patch("app.litellm.completion", return_value=chunks):
             events, _, _ = _app._stream_delimited_response(
                 "claude-sonnet-4-6", "ctx", "question", self._DELIM, _app._sse_emit
             )
         full_text = _app._extract_answer_from_events(events)
         assert "Just an answer" in full_text
 
-    def test_usage_defaults_on_exception(self):
-        stream_cm = _make_stream_cm([])
-        stream_cm.get_final_message.side_effect = Exception("stream error")
-        with patch("app.client") as mock_client:
-            mock_client.messages.stream.return_value = stream_cm
+    def test_usage_defaults_when_absent(self):
+        chunk = MagicMock()
+        chunk.choices = [MagicMock(delta=MagicMock(content="hello"))]
+        chunk.usage = None
+        with patch("app.litellm.completion", return_value=iter([chunk])):
             _, _, usage = _app._stream_delimited_response(
                 "claude-sonnet-4-6", "ctx", "q", self._DELIM, _app._sse_emit
             )
@@ -920,7 +914,7 @@ class TestStreamDelimitedResponse:
 
 # ── Flask routes ──────────────────────────────────────────────────────────────
 
-@pytest.fixture()
+@pytest.fixture
 def flask_client():
     _app.app.config["TESTING"] = True
     with _app.app.test_client() as c:
@@ -1183,7 +1177,7 @@ class TestBuildRtf:
 # Flask route tests (mocked DB + external calls)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@pytest.fixture()
+@pytest.fixture
 def client():
     _app.app.config["TESTING"] = True
     with _app.app.test_client() as c:
@@ -1351,9 +1345,10 @@ class TestCollectionAskRoute:
 
     def test_invalid_model_falls_back_to_default(self, client):
         # Just verify the model validation logic directly
-        model = "invalid-model"
-        if model not in cfg.ALLOWED_CHAT_MODELS:
-            model = cfg.DEFAULT_CHAT_MODEL
+        with patch("app.available_chat_models", return_value={"claude-sonnet-4-6": {}}):
+            model = "invalid-model"
+            if model not in _app.available_chat_models():
+                model = cfg.DEFAULT_CHAT_MODEL
         assert model == cfg.DEFAULT_CHAT_MODEL
 
 

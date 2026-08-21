@@ -24,14 +24,14 @@ import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import anthropic
+import litellm
 import numpy as np
 import requests
 from docx import Document
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import RGBColor
-from flask import Flask, Response, render_template, request, stream_with_context
+from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 from dotenv import load_dotenv
 
 import db
@@ -80,7 +80,74 @@ _SSE_MIMETYPE = "text/event-stream"
 
 app = Flask(__name__)
 app.jinja_env.globals["static_version"] = cfg.STATIC_VERSION
-client = anthropic.Anthropic()
+
+# ── Available models (resolved once at first request) ─────────────────────────
+
+_available_models_cache: dict[str, dict] | None = None
+
+
+def _discover_ollama_models() -> dict[str, dict]:
+    try:
+        resp = requests.get(f"{cfg.OLLAMA_BASE_URL}/api/tags", timeout=2)
+        if resp.status_code != 200:
+            return {}
+        return {
+            f"ollama/{m['name']}": {
+                "display":      m["name"],
+                "provider":     "ollama",
+                "requires_key": "",
+                "input_price":  0.0,
+                "output_price": 0.0,
+            }
+            for m in resp.json().get("models", [])
+        }
+    except Exception:
+        return {}
+
+
+def _discover_ollama_cloud_models() -> dict[str, dict]:
+    """Ollama Cloud's hosted model catalog — not "pulled" models, a fixed list per account."""
+    if not cfg.OLLAMA_API_KEY:
+        return {}
+    try:
+        resp = requests.get(
+            f"{cfg.OLLAMA_CLOUD_BASE_URL}/api/tags",
+            headers={"Authorization": f"Bearer {cfg.OLLAMA_API_KEY}"},
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            return {}
+        return {
+            f"ollama_chat/{m['name']}": {
+                "display":      m["name"],
+                "provider":     "ollama-cloud",
+                "requires_key": "",
+                "input_price":  0.0,
+                "output_price": 0.0,
+            }
+            for m in resp.json().get("models", [])
+        }
+    except Exception:
+        return {}
+
+
+def available_chat_models() -> dict[str, dict]:
+    """Static (env-key-gated) models, cached once, plus fresh Ollama discovery each call."""
+    global _available_models_cache
+    static_models = _available_models_cache
+    if static_models is None:
+        static_models = {
+            mid: meta
+            for mid, meta in cfg.CHAT_MODELS.items()
+            if os.getenv(meta.get("requires_key", ""), "")
+        }
+        _available_models_cache = static_models
+        _log.info("Available static chat models: %s", list(static_models))
+    result = dict(static_models)
+    result.update(_discover_ollama_models())
+    result.update(_discover_ollama_cloud_models())
+    return result
+
 
 # ── Embeddings ────────────────────────────────────────────────────────────────
 
@@ -132,20 +199,24 @@ def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> list[st
 def build_pubmed_query(english_query: str) -> str:
     _claude_log.debug("op=build_query query=%r", english_query[:120])
     t0 = time.perf_counter()
-    with client.messages.stream(
+    response = litellm.completion(
         model=cfg.QUERY_BUILDER_MODEL,
         max_tokens=cfg.MAX_TOKENS_PUBMED_QUERY,
-        thinking={"type": "adaptive"},
-        system=cfg.PROMPT_PUBMED_QUERY,
-        messages=[{"role": "user", "content": english_query}],
-    ) as stream:
-        msg = stream.get_final_message()
-        text_block = next(b for b in msg.content if b.type == "text")
-        result = text_block.text.strip()
+        thinking={"type": "enabled", "budget_tokens": cfg.PUBMED_QUERY_THINKING_BUDGET},
+        messages=[
+            {"role": "system", "content": cfg.PROMPT_PUBMED_QUERY},
+            {"role": "user",   "content": english_query},
+        ],
+    )
+    result = (response.choices[0].message.content or "").strip()
     elapsed = time.perf_counter() - t0
+    usage = response.usage
     _claude_log.info(
         "op=build_query model=%s in_tokens=%d out_tokens=%d duration=%.2fs",
-        cfg.QUERY_BUILDER_MODEL, msg.usage.input_tokens, msg.usage.output_tokens, elapsed,
+        cfg.QUERY_BUILDER_MODEL,
+        getattr(usage, "prompt_tokens", 0),
+        getattr(usage, "completion_tokens", 0),
+        elapsed,
     )
     _claude_log.debug("op=build_query result=%r", result)
     return result
@@ -312,7 +383,6 @@ def _extract_pmcid(linkset: dict) -> tuple[str, str] | None:
             return pmid, str(lsdb["links"][0])
     return None
 
-
 def _fetch_pmcid_batch(batch: list[str]) -> dict[str, str]:
     resp = _ncbi_post(
         f"{cfg.PUBMED_BASE}/elink.fcgi",
@@ -320,9 +390,11 @@ def _fetch_pmcid_batch(batch: list[str]) -> dict[str, str]:
         timeout=cfg.TIMEOUT_ELINK,
     )
     resp.raise_for_status()
-    return dict(
-        p for p in map(_extract_pmcid, resp.json().get("linksets", [])) if p is not None
-    )
+    return {
+        p[0]: p[1]
+        for p in map(_extract_pmcid, resp.json().get("linksets", []))
+        if p is not None
+    }
 
 
 def get_pmcids(pmids: list[str]) -> dict[str, str]:
@@ -397,7 +469,7 @@ def _run_search(user_query: str, max_results: int) -> tuple[list[dict] | None, s
         if results:
             _attach_similarities(user_query, results)
         return results, pubmed_query, None
-    except anthropic.AuthenticationError:
+    except litellm.exceptions.AuthenticationError:
         return None, None, "Invalid Anthropic API key. Set ANTHROPIC_API_KEY in your .env file."
     except requests.RequestException as exc:
         return None, None, f"PubMed request failed: {exc}"
@@ -597,17 +669,25 @@ def generate_starter_questions(user_query: str, articles: list[dict]) -> list[st
     _claude_log.debug("op=starter_questions topic=%r articles=%d", user_query[:80], len(articles))
     t0 = time.perf_counter()
     try:
-        msg = client.messages.create(
+        kwargs = {}
+        if cfg.STARTER_QUESTIONS_MODEL.startswith("ollama/"):
+            kwargs["api_base"] = cfg.OLLAMA_BASE_URL
+        response = litellm.completion(
             model=cfg.STARTER_QUESTIONS_MODEL,
             max_tokens=cfg.MAX_TOKENS_STARTER_QS,
-            system=cfg.PROMPT_STARTER_QUESTIONS,
-            messages=[{"role": "user", "content": f"Topic: {user_query}\n\nArticles:\n{titles}"}],
+            messages=[
+                {"role": "system", "content": cfg.PROMPT_STARTER_QUESTIONS},
+                {"role": "user", "content": f"Topic: {user_query}\n\nArticles:\n{titles}"},
+            ],
+            **kwargs,
         )
-        questions = json.loads(msg.content[0].text.strip())[:4]
+        content = (response.choices[0].message.content or "").strip()
+        questions = json.loads(_strip_json_fence(content))[:4]
         elapsed = time.perf_counter() - t0
+        usage = response.usage
         _claude_log.info(
             "op=starter_questions in_tokens=%d out_tokens=%d questions=%d duration=%.2fs",
-            msg.usage.input_tokens, msg.usage.output_tokens, len(questions), elapsed,
+            getattr(usage, "prompt_tokens", 0), getattr(usage, "completion_tokens", 0), len(questions), elapsed,
         )
         return questions
     except Exception as exc:
@@ -674,17 +754,26 @@ def _sse_emit(payload: dict) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
+def _strip_json_fence(text: str) -> str:
+    """Strip a ```json ... ``` (or bare ```) markdown fence some models wrap JSON output in."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
+        text = re.sub(r"\n?```$", "", text)
+    return text.strip()
+
+
 def _parse_suggestions(raw: str) -> list[str]:
     try:
-        return json.loads(raw.strip())[:4]
+        return json.loads(_strip_json_fence(raw))[:4]
     except Exception:
         return []
 
 
 def _compute_cost(model: str, input_tokens: int, output_tokens: int) -> float:
-    """Return the USD cost for one API call at Anthropic list prices."""
-    pricing = cfg.MODEL_PRICING.get(model, {"input": 0.0, "output": 0.0})
-    return (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1_000_000
+    """Return the USD cost for one API call at provider list prices."""
+    pricing = cfg.CHAT_MODELS.get(model, {"input_price": 0.0, "output_price": 0.0})
+    return (input_tokens * pricing["input_price"] + output_tokens * pricing["output_price"]) / 1_000_000
 
 
 def _stream_delimited_response(
@@ -700,26 +789,41 @@ def _stream_delimited_response(
     found = False
     events: list[str] = []
 
-    with client.messages.stream(
+    kwargs = {}
+    if model.startswith("ollama_chat/"):
+        kwargs["api_base"] = cfg.OLLAMA_CLOUD_BASE_URL
+        kwargs["api_key"] = cfg.OLLAMA_API_KEY
+    elif model.startswith("ollama/"):
+        kwargs["api_base"] = cfg.OLLAMA_BASE_URL
+
+    usage = {"input_tokens": 0, "output_tokens": 0}
+    stream = litellm.completion(
         model=model,
         max_tokens=cfg.MAX_TOKENS_RAG_RESPONSE,
-        system=cfg.PROMPT_RAG_SYSTEM,
-        messages=[{"role": "user", "content": f"Articles:\n\n{context}\n\nQuestion: {question}"}],
-    ) as stream:
-        for text in stream.text_stream:
-            pre, post, found, chunk_events = _advance_delimiter_state(
-                pre, post, found, text, delim, emit
-            )
-            events.extend(chunk_events)
-        try:
-            final_msg = stream.get_final_message()
+        stream=True,
+        stream_options={"include_usage": True},
+        messages=[
+            {"role": "system", "content": cfg.PROMPT_RAG_SYSTEM},
+            {"role": "user", "content": f"Articles:\n\n{context}\n\nQuestion: {question}"},
+        ],
+        **kwargs,
+    )
+    for chunk in stream:
+        chunk_usage = getattr(chunk, "usage", None)
+        if chunk_usage is not None:
             usage = {
-                "input_tokens":  final_msg.usage.input_tokens,
-                "output_tokens": final_msg.usage.output_tokens,
+                "input_tokens":  getattr(chunk_usage, "prompt_tokens", 0) or 0,
+                "output_tokens": getattr(chunk_usage, "completion_tokens", 0) or 0,
             }
-        except Exception as exc:
-            _claude_log.warning("op=stream_usage failed: %s", exc)
-            usage = {"input_tokens": 0, "output_tokens": 0}
+        if not chunk.choices:
+            continue
+        text = chunk.choices[0].delta.content or ""
+        if not text:
+            continue
+        pre, post, found, chunk_events = _advance_delimiter_state(
+            pre, post, found, text, delim, emit
+        )
+        events.extend(chunk_events)
 
     if not found and pre:
         events.append(emit({"text": pre}))
@@ -818,6 +922,16 @@ def conversation_delete(vid: int):
     return {"ok": True}
 
 
+@app.route("/api/models", methods=["GET"])
+def api_models():
+    """List chat models currently available: env-key-gated providers + discovered Ollama models."""
+    models = [
+        {"id": mid, "display": meta["display"], "provider": meta["provider"]}
+        for mid, meta in available_chat_models().items()
+    ]
+    return {"models": models, "default": cfg.DEFAULT_CHAT_MODEL}
+
+
 @app.route("/collections/<int:cid>/ask", methods=["POST"])
 def collection_ask(cid: int):
     """SSE endpoint: embeds question, retrieves top-k chunks, streams RAG answer."""
@@ -826,7 +940,7 @@ def collection_ask(cid: int):
     if not question:
         return {"error": "No question provided."}, 400
     model = data.get("model", cfg.DEFAULT_CHAT_MODEL)
-    if model not in cfg.ALLOWED_CHAT_MODELS:
+    if model not in available_chat_models():
         model = cfg.DEFAULT_CHAT_MODEL
     conversation_id = data.get("conversation_id")
 
@@ -880,7 +994,7 @@ def collection_ask(cid: int):
                 model, context, question, _DELIM, _sse_emit
             )
         except Exception as exc:
-            _claude_log.error("op=collection_ask FAILED cid=%d: %s", cid, exc)
+            _claude_log.exception("op=collection_ask FAILED cid=%d: %s", cid, exc)
             yield _sse_emit({"error": str(exc)})
             return
 

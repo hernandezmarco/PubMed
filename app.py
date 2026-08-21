@@ -13,12 +13,14 @@
 # For information contact Marco Hernandez <ragettyandy@gmail.com>
 
 import csv
+import datetime
 import io
 import json
 import logging
 import logging.handlers
 import os
 import re
+import secrets
 import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -31,9 +33,13 @@ from docx import Document
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import RGBColor
-from flask import Flask, Response, jsonify, render_template, request, stream_with_context
+from flask import Flask, Response, g, jsonify, make_response, redirect, render_template, request, stream_with_context, url_for
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from flask_wtf import CSRFProtect
 from dotenv import load_dotenv
 
+import auth
 import db
 import config as cfg
 
@@ -80,9 +86,15 @@ _SSE_MIMETYPE = "text/event-stream"
 
 app = Flask(__name__)
 app.jinja_env.globals["static_version"] = cfg.STATIC_VERSION
-# No CSRF protection (flask-wtf): no session/cookie-based auth exists anywhere in this
-# app, so there's no ambient credential for a forged cross-site request to ride. Revisit
-# if login/session auth is ever added.
+app.secret_key = cfg.FLASK_SECRET_KEY
+if not cfg.FLASK_SECRET_KEY:
+    _log.warning(
+        "FLASK_SECRET_KEY is not set — the session (and CSRF tokens riding on it) "
+        "won't work. Set FLASK_SECRET_KEY in your .env before relying on this for anything real."
+    )
+csrf = CSRFProtect(app)
+
+limiter = Limiter(key_func=get_remote_address, app=app, storage_uri="memory://")
 
 # ── Available models (resolved once at first request) ─────────────────────────
 
@@ -480,7 +492,168 @@ def _run_search(user_query: str, max_results: int) -> tuple[list[dict] | None, s
         return None, None, str(exc)
 
 
+@app.context_processor
+def inject_current_user():
+    """Makes current_user_email available to every template (None when logged out)."""
+    if getattr(g, "user_id", None) is None:
+        return {"current_user_email": None}
+    user = db.get_user_by_id(g.user_id)
+    return {"current_user_email": user["email"] if user else None}
+
+
+def _issue_auth_cookies(user_id: int) -> Response:
+    """Set the access + refresh cookies for a freshly authenticated user_id."""
+    access_token = auth.create_access_token(user_id)
+    refresh_token = secrets.token_urlsafe(32)
+    refresh_expires = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+        days=cfg.JWT_REFRESH_TTL_DAYS
+    )
+    db.create_refresh_token(user_id, auth.hash_token(refresh_token), refresh_expires)
+
+    resp = make_response(jsonify({"ok": True}))
+    resp.set_cookie(
+        auth.ACCESS_COOKIE_NAME, access_token,
+        httponly=True, secure=cfg.COOKIE_SECURE, samesite="Lax",
+        max_age=cfg.JWT_ACCESS_TTL_MINUTES * 60,
+    )
+    # Scoped to /auth so it's only ever sent to the refresh/logout endpoints, not on
+    # every request the way the access cookie is.
+    resp.set_cookie(
+        auth.REFRESH_COOKIE_NAME, refresh_token,
+        httponly=True, secure=cfg.COOKIE_SECURE, samesite="Lax",
+        max_age=cfg.JWT_REFRESH_TTL_DAYS * 86400, path="/auth",
+    )
+    return resp
+
+
+@app.route("/login", methods=["GET"])
+def login_page():
+    return render_template("login.html")
+
+
+@app.route("/register", methods=["GET"])
+def register_page():
+    return render_template("register.html")
+
+
+@app.route("/auth/register", methods=["POST"])
+@limiter.limit(cfg.REGISTER_RATE_LIMIT)
+def auth_register():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+
+    if not email or "@" not in email:
+        return jsonify({"error": "A valid email is required."}), 400
+    if len(password) < 8:
+        return jsonify({"error": "Password must be at least 8 characters."}), 400
+    if db.get_user_by_email(email):
+        return jsonify({"error": "An account with that email already exists."}), 409
+
+    user_id = db.create_user(email, auth.hash_password(password))
+    return _issue_auth_cookies(user_id)
+
+
+@app.route("/auth/login", methods=["POST"])
+@limiter.limit(cfg.LOGIN_RATE_LIMIT)
+def auth_login():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+
+    user = db.get_user_by_email(email)
+    if not user or not user["is_active"] or not auth.verify_password(password, user["password_hash"]):
+        return jsonify({"error": "Invalid email or password."}), 401
+
+    return _issue_auth_cookies(user["id"])
+
+
+@app.route("/auth/refresh", methods=["POST"])
+def auth_refresh():
+    raw_token = request.cookies.get(auth.REFRESH_COOKIE_NAME)
+    if not raw_token:
+        return jsonify({"error": "Not authenticated."}), 401
+
+    token_hash = auth.hash_token(raw_token)
+    valid = db.get_valid_refresh_token(token_hash)
+    if not valid:
+        return jsonify({"error": "Not authenticated."}), 401
+
+    # Rotate: the old refresh token is single-use — revoke it, issue a fresh pair.
+    db.revoke_refresh_token(token_hash)
+    return _issue_auth_cookies(valid["user_id"])
+
+
+@app.route("/auth/logout", methods=["POST"])
+def auth_logout():
+    raw_token = request.cookies.get(auth.REFRESH_COOKIE_NAME)
+    if raw_token:
+        db.revoke_refresh_token(auth.hash_token(raw_token))
+    resp = make_response(jsonify({"ok": True}))
+    resp.delete_cookie(auth.ACCESS_COOKIE_NAME)
+    resp.delete_cookie(auth.REFRESH_COOKIE_NAME, path="/auth")
+    return resp
+
+
+@app.route("/forgot-password", methods=["GET"])
+def forgot_password_page():
+    return render_template("forgot_password.html")
+
+
+@app.route("/reset-password", methods=["GET"])
+def reset_password_page():
+    return render_template("reset_password.html")
+
+
+@app.route("/auth/forgot-password", methods=["POST"])
+@limiter.limit(cfg.FORGOT_PASSWORD_RATE_LIMIT)
+def auth_forgot_password():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+
+    # Always return the same generic response whether or not the account exists —
+    # otherwise this endpoint becomes an email-enumeration oracle.
+    generic_response = jsonify({
+        "ok": True,
+        "message": "If an account with that email exists, a reset link has been sent.",
+    })
+
+    user = db.get_user_by_email(email) if email else None
+    if user and user["is_active"]:
+        raw_token = secrets.token_urlsafe(32)
+        expires = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+            minutes=cfg.PASSWORD_RESET_TTL_MINUTES
+        )
+        db.create_password_reset_token(user["id"], auth.hash_token(raw_token), expires)
+        auth.send_password_reset_email(user["email"], raw_token)
+
+    return generic_response
+
+
+@app.route("/auth/reset-password", methods=["POST"])
+def auth_reset_password():
+    data = request.get_json(silent=True) or {}
+    raw_token = data.get("token") or ""
+    new_password = data.get("password") or ""
+
+    if len(new_password) < 8:
+        return jsonify({"error": "Password must be at least 8 characters."}), 400
+
+    valid = db.get_valid_password_reset_token(auth.hash_token(raw_token))
+    if not valid:
+        return jsonify({"error": "This reset link is invalid or has expired."}), 400
+
+    db.update_user_password(valid["user_id"], auth.hash_password(new_password))
+    db.mark_password_reset_token_used(valid["id"])
+    # A password reset is a "log out everywhere" signal — any stolen/leaked refresh
+    # token from before the reset should stop working.
+    db.revoke_all_refresh_tokens(valid["user_id"])
+
+    return jsonify({"ok": True})
+
+
 @app.route("/", methods=["GET", "POST"])
+@auth.login_required_page
 def index():
     results = None
     pubmed_query = None
@@ -505,12 +678,14 @@ def index():
 
 
 @app.route("/collections", methods=["GET"])
+@auth.login_required_page
 def collections():
-    items = db.list_collections()
+    items = db.list_collections(g.user_id)
     return render_template("collections.html", collections=items)
 
 
 @app.route("/collections", methods=["POST"])
+@auth.login_required
 def collections_save():
     """Receive selected articles, fetch PMC full text where available, chunk, embed, store."""
     payload = request.get_json(force=True)
@@ -527,7 +702,7 @@ def collections_save():
     try:
         pmids = [a["pmid"] for a in articles]
         pmcid_map = get_pmcids(pmids)
-        cid = db.create_collection(name, user_query, pubmed_query)
+        cid = db.create_collection(name, user_query, pubmed_query, g.user_id)
 
         # Phase 1: fetch PMC full texts in parallel (I/O-bound network calls)
         max_workers = min(len(articles), 8)
@@ -614,6 +789,7 @@ def _save_embed_phase(pending: list[tuple[str, list[str]]], counts: dict):
 
 
 @app.route("/collections/save-stream", methods=["POST"])
+@auth.login_required
 def collections_save_stream():
     """SSE endpoint: save collection with per-article fetch + embedding progress."""
     payload = request.get_json(force=True)
@@ -621,6 +797,7 @@ def collections_save_stream():
     user_query = payload.get("user_query", "")
     pubmed_query = payload.get("pubmed_query", "")
     articles = payload.get("articles", [])
+    user_id = g.user_id
 
     if not name:
         return {"error": "Collection name is required."}, 400
@@ -630,7 +807,7 @@ def collections_save_stream():
     def generate():
         try:
             pmcid_map = get_pmcids([a["pmid"] for a in articles])
-            cid = db.create_collection(name, user_query, pubmed_query)
+            cid = db.create_collection(name, user_query, pubmed_query, user_id)
             fetched, counts = yield from _save_fetch_phase(articles, pmcid_map)
             pending = _save_persist_phase(cid, fetched)
             yield from _save_embed_phase(pending, counts)
@@ -699,8 +876,9 @@ def generate_starter_questions(user_query: str, articles: list[dict]) -> list[st
 
 
 @app.route("/collections/<int:cid>", methods=["GET"])
+@auth.login_required_page
 def collection_detail(cid: int):
-    collection = db.get_collection(cid)
+    collection = db.get_collection(cid, g.user_id)
     if not collection:
         return "Collection not found", 404
     articles = db.get_collection_articles(cid)
@@ -712,8 +890,9 @@ def collection_detail(cid: int):
 
 
 @app.route("/collections/<int:cid>/export.csv", methods=["GET"])
+@auth.login_required
 def collection_export_csv(cid: int):
-    collection = db.get_collection(cid)
+    collection = db.get_collection(cid, g.user_id)
     if not collection:
         return "Collection not found", 404
     articles = db.get_collection_articles(cid)
@@ -740,11 +919,15 @@ def collection_export_csv(cid: int):
 
 
 @app.route("/collections/<int:cid>/starter-questions", methods=["GET"])
+@auth.login_required
 def collection_starter_questions(cid: int):
+    # Ownership must be checked before the cache lookup, not inside the cache-miss
+    # branch — otherwise a cache hit would skip authorization and leak another
+    # user's cached questions to anyone who guesses their cid.
+    collection = db.get_collection(cid, g.user_id)
+    if not collection:
+        return {"questions": []}
     if cid not in _starter_questions_cache:
-        collection = db.get_collection(cid)
-        if not collection:
-            return {"questions": []}
         articles = db.get_collection_articles(cid)
         _starter_questions_cache[cid] = generate_starter_questions(
             collection["user_query"], articles
@@ -899,18 +1082,38 @@ def _extract_answer_from_events(events: list[str]) -> str:
     return "".join(parts)
 
 
+_CONVERSATION_NOT_FOUND = "Conversation not found."
+
+
+def _get_owned_conversation(vid: int) -> dict | None:
+    """Return the conversation only if it exists AND its collection is owned by g.user_id."""
+    conv = db.get_conversation(vid)
+    if not conv or conv["user_id"] != g.user_id:
+        return None
+    return conv
+
+
 @app.route("/collections/<int:cid>/conversations", methods=["GET"])
+@auth.login_required
 def collection_conversations(cid: int):
+    if not db.get_collection(cid, g.user_id):
+        return {"error": "Collection not found."}, 404
     return db.list_conversations(cid)
 
 
 @app.route("/conversations/<int:vid>/messages", methods=["GET"])
+@auth.login_required
 def conversation_messages(vid: int):
+    if not _get_owned_conversation(vid):
+        return {"error": _CONVERSATION_NOT_FOUND}, 404
     return db.get_conversation_messages(vid)
 
 
 @app.route("/conversations/<int:vid>/rename", methods=["PATCH"])
+@auth.login_required
 def conversation_rename(vid: int):
+    if not _get_owned_conversation(vid):
+        return {"error": _CONVERSATION_NOT_FOUND}, 404
     data  = request.get_json(force=True)
     title = (data.get("title") or "").strip()
     if not title:
@@ -920,12 +1123,16 @@ def conversation_rename(vid: int):
 
 
 @app.route("/conversations/<int:vid>/delete", methods=["POST"])
+@auth.login_required
 def conversation_delete(vid: int):
+    if not _get_owned_conversation(vid):
+        return {"error": _CONVERSATION_NOT_FOUND}, 404
     db.delete_conversation(vid)
     return {"ok": True}
 
 
 @app.route("/api/models", methods=["GET"])
+@auth.login_required
 def api_models():
     """List chat models currently available: env-key-gated providers + discovered Ollama models."""
     models = [
@@ -936,8 +1143,11 @@ def api_models():
 
 
 @app.route("/collections/<int:cid>/ask", methods=["POST"])
+@auth.login_required
 def collection_ask(cid: int):
     """SSE endpoint: embeds question, retrieves top-k chunks, streams RAG answer."""
+    if not db.get_collection(cid, g.user_id):
+        return {"error": "Collection not found."}, 404
     data = request.get_json(force=True)
     question = (data.get("question") or "").strip()
     if not question:
@@ -946,6 +1156,13 @@ def collection_ask(cid: int):
     if model not in available_chat_models():
         model = cfg.DEFAULT_CHAT_MODEL
     conversation_id = data.get("conversation_id")
+    # A client-supplied conversation_id could belong to another user's conversation
+    # (or a different collection); only trust it if it's actually owned by this user
+    # and attached to this collection, otherwise start a fresh one.
+    if conversation_id is not None:
+        owned_conv = _get_owned_conversation(conversation_id)
+        if not owned_conv or owned_conv["collection_id"] != cid:
+            conversation_id = None
 
     q_emb = embed_texts([question])[0]
     top_chunks = db.semantic_search(cid, q_emb, k=cfg.SEMANTIC_SEARCH_K)
@@ -1031,8 +1248,9 @@ def collection_ask(cid: int):
 
 
 @app.route("/collections/<int:cid>/delete", methods=["POST"])
+@auth.login_required
 def collection_delete(cid: int):
-    db.delete_collection(cid)
+    db.delete_collection(cid, g.user_id)
     return {"ok": True}
 
 
@@ -1236,12 +1454,13 @@ def _build_docx(title: str, collection_name: str, created_at: str, messages: lis
 
 
 @app.route("/conversations/<int:vid>/export", methods=["GET"])
+@auth.login_required
 def conversation_export(vid: int):
     fmt = request.args.get("format", "docx").lower()
     if fmt not in ("docx", "rtf"):
         return {"error": "format must be 'docx' or 'rtf'"}, 400
 
-    conv = db.get_conversation(vid)
+    conv = _get_owned_conversation(vid)
     if not conv:
         return "Conversation not found", 404
 

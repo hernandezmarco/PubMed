@@ -90,16 +90,16 @@ class TestCreateCollection:
     def test_returns_new_id(self):
         conn, _ = _make_conn(rows=[(42,)])
         with patch("db._connect", return_value=conn):
-            cid = db.create_collection("My Collection", "diabetes", "diabetes[MeSH]")
+            cid = db.create_collection("My Collection", "diabetes", "diabetes[MeSH]", 7)
         assert cid == 42
 
     def test_inserts_correct_values(self):
         conn, cur = _make_conn(rows=[(1,)])
         with patch("db._connect", return_value=conn):
-            db.create_collection("Name", "user q", "pubmed q")
+            db.create_collection("Name", "user q", "pubmed q", 7)
         sql, params = cur.execute.call_args.args
         assert "INSERT INTO rag_collections" in sql
-        assert params == ("Name", "user q", "pubmed q")
+        assert params == ("Name", "user q", "pubmed q", 7)
 
 
 # ── add_article ───────────────────────────────────────────────────────────────
@@ -219,7 +219,7 @@ class TestListCollections:
         conn, cur = _make_conn()
         cur.fetchall.return_value = [row]
         with patch("db._connect", return_value=conn):
-            result = db.list_collections()
+            result = db.list_collections(7)
         assert isinstance(result, list)
         assert result[0]["name"] == "C"
 
@@ -227,7 +227,7 @@ class TestListCollections:
         conn, cur = _make_conn()
         cur.fetchall.return_value = []
         with patch("db._connect", return_value=conn):
-            result = db.list_collections()
+            result = db.list_collections(7)
         assert result == []
 
 
@@ -241,23 +241,23 @@ class TestGetCollection:
         conn, cur = _make_conn()
         cur.fetchone.return_value = row
         with patch("db._connect", return_value=conn):
-            result = db.get_collection(5)
+            result = db.get_collection(5, 7)
         assert result["id"] == 5
 
     def test_returns_none_when_not_found(self):
         conn, cur = _make_conn()
         cur.fetchone.return_value = None
         with patch("db._connect", return_value=conn):
-            result = db.get_collection(999)
+            result = db.get_collection(999, 7)
         assert result is None
 
     def test_passes_cid_to_query(self):
         conn, cur = _make_conn()
         cur.fetchone.return_value = None
         with patch("db._connect", return_value=conn):
-            db.get_collection(77)
+            db.get_collection(77, 7)
         _, params = cur.execute.call_args.args
-        assert params == (77,)
+        assert params == (77, 7)
 
 
 # ── get_collection_articles ───────────────────────────────────────────────────
@@ -337,10 +337,10 @@ class TestSemanticSearch:
 class TestDeleteCollection:
     def test_issues_delete(self, mock_conn):
         _, cur = mock_conn
-        db.delete_collection(5)
+        db.delete_collection(5, 7)
         sql, params = cur.execute.call_args.args
         assert "DELETE FROM rag_collections" in sql
-        assert params == (5,)
+        assert params == (5, 7)
 
 
 # ── create_conversation ───────────────────────────────────────────────────────

@@ -12,6 +12,48 @@
 //
 // For information contact Marco Hernandez <ragettyandy@gmail.com>
 
+// ── CSRF-aware fetch wrapper ─────────────────────────────────────────────────
+// Attaches the CSRF token (from the meta tag base.html renders) to any mutating
+// request. On a 401 (access token expired), tries a silent /auth/refresh once and
+// retries the original request; only redirects to /login if that also fails.
+const CSRF_TOKEN = document.querySelector('meta[name="csrf-token"]')?.content || '';
+const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS', 'TRACE']);
+
+async function authFetch(url, options = {}, _isRetry = false) {
+  const method = (options.method || 'GET').toUpperCase();
+  const headers = new Headers(options.headers || {});
+  if (!SAFE_METHODS.has(method)) {
+    headers.set('X-CSRFToken', CSRF_TOKEN);
+  }
+  const resp = await fetch(url, { ...options, headers });
+  // /auth/* routes return 401 for "wrong credentials," not "session expired" —
+  // that's a normal response the caller (the login form) needs to handle itself.
+  const isAuthEndpoint = typeof url === 'string' && url.startsWith('/auth/');
+  if (resp.status === 401 && !isAuthEndpoint) {
+    if (!_isRetry) {
+      const refreshResp = await fetch('/auth/refresh', {
+        method: 'POST',
+        headers: { 'X-CSRFToken': CSRF_TOKEN },
+      });
+      if (refreshResp.ok) {
+        return authFetch(url, options, true);
+      }
+    }
+    const next = encodeURIComponent(window.location.pathname + window.location.search);
+    window.location.href = `/login?next=${next}`;
+  }
+  return resp;
+}
+
+// ── Logout ────────────────────────────────────────────────────────────────────
+const logoutBtn = document.getElementById('logout-btn');
+if (logoutBtn) {
+  logoutBtn.addEventListener('click', async () => {
+    await authFetch('/auth/logout', { method: 'POST' });
+    window.location.href = '/login';
+  });
+}
+
 const bar = document.getElementById('progress-bar');
 
 const Progress = {

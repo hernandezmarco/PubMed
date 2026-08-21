@@ -90,6 +90,22 @@ DB_NAME=pubmed_ai
 DB_USER=your_db_user
 DB_PASSWORD=your_db_password
 
+# Required — every page requires login. Generate each with:
+#   python -c "import secrets; print(secrets.token_urlsafe(48))"
+# Two different values on purpose — different subsystems (JWT vs. Flask session/CSRF)
+# shouldn't share a signing key.
+JWT_SECRET_KEY=
+FLASK_SECRET_KEY=
+
+# Optional — password reset emails. Unset = the reset token is still created but no
+# email is sent (logged, not an error) — fine for local dev.
+SMTP_HOST=
+SMTP_PORT=587
+SMTP_USER=
+SMTP_PASSWORD=
+SMTP_FROM=PubMed AI <noreply@localhost>
+APP_BASE_URL=http://127.0.0.1:8080
+
 # Optional — NCBI E-utilities API key (raises rate limit 3 → 10 req/s)
 # Register free at https://www.ncbi.nlm.nih.gov/account/
 PUBMED_API=your_ncbi_api_key
@@ -106,6 +122,8 @@ DEFAULT_CHAT_MODEL=claude-opus-4-6
 EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
 ```
 
+See [Environment Variables](#environment-variables) below for the full list, including auth token lifetimes and rate limits.
+
 ### 4. Initialise the database
 
 The app creates all tables automatically on first start. Just make sure the database exists:
@@ -120,21 +138,60 @@ createdb pubmed_ai
 python app.py
 ```
 
-Open [http://127.0.0.1:8080](http://127.0.0.1:8080).
+Open [http://127.0.0.1:8080](http://127.0.0.1:8080). Every page requires an account — register one at `/register`, or run `python -m scripts.bootstrap_admin` to create/promote a specific account (it also reassigns any pre-auth collections, `user_id IS NULL`, to that account).
 
 The first search will download the `BAAI/bge-small-en-v1.5` embedding model (~130 MB) into `~/.cache/fastembed`. Subsequent starts are instant.
 
 ---
 
+## Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | — | Required. Anthropic API key. |
+| `OPENAI_API_KEY` | — | Optional. Enables OpenAI models in the chat model dropdown. |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Optional. Local Ollama server; models pulled there are auto-discovered into the chat model dropdown. |
+| `OLLAMA_API_KEY` | — | Optional. Ollama Cloud (`https://ollama.com`) key; adds your account's hosted model catalog to the chat model dropdown. |
+| `DB_HOST` / `DB_NAME` / `DB_USER` / `DB_PASSWORD` | — | PostgreSQL connection. |
+| `PUBMED_API` | — | Optional. NCBI E-utilities API key. Raises rate limit from 3 → 10 req/s. |
+| `LOG_LEVEL` | `INFO` | Logging verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR`. |
+| `JWT_SECRET_KEY` | *(empty)* | **Required.** Signs/verifies access-token JWTs. Logs a startup warning if unset. |
+| `JWT_ACCESS_TTL_MINUTES` | `30` | Access token lifetime. |
+| `JWT_REFRESH_TTL_DAYS` | `30` | Refresh token lifetime (stored server-side, revocable). |
+| `COOKIE_SECURE` | `true` | `Secure` flag on auth cookies. Only set `false` for plain-HTTP local dev without TLS. |
+| `FLASK_SECRET_KEY` | *(empty)* | **Required.** Signs the Flask session cookie that CSRF tokens ride on — a different key from `JWT_SECRET_KEY` on purpose. Logs a startup warning if unset. |
+| `LOGIN_RATE_LIMIT` | `5 per minute` | Rate limit on `POST /auth/login`. |
+| `REGISTER_RATE_LIMIT` | `5 per hour` | Rate limit on `POST /auth/register`. |
+| `FORGOT_PASSWORD_RATE_LIMIT` | `3 per hour` | Rate limit on `POST /auth/forgot-password`. |
+| `PASSWORD_RESET_TTL_MINUTES` | `60` | How long a password-reset link stays valid. |
+| `SMTP_HOST` | *(empty)* | Optional. Enables password-reset emails; unset just skips sending (the reset token is still created — logged, not an error). |
+| `SMTP_PORT` | `587` | SMTP port (STARTTLS). |
+| `SMTP_USER` / `SMTP_PASSWORD` | — | Optional SMTP auth. |
+| `SMTP_FROM` | `PubMed AI <noreply@localhost>` | From address on reset emails. |
+| `APP_BASE_URL` | `https://localhost:8080` | Base URL used to build the link in reset emails. |
+
+---
+
 ## Docker
 
-The Docker image pre-bakes the embedding model so there is no download delay on startup.
+The Docker image pre-bakes the embedding model so there is no download delay on startup. The container is served by **gunicorn over TLS**, not the Flask dev server.
 
 ### Build
 
 ```bash
 docker build -t pubmed-ai .
 ```
+
+### Generate a TLS certificate
+
+Required once before running — gunicorn's `CMD` expects `certs/cert.pem` and `certs/key.pem` to exist:
+
+```bash
+mkdir -p certs
+openssl req -x509 -newkey rsa:4096 -nodes -keyout certs/key.pem -out certs/cert.pem -days 365 -subj "/CN=localhost"
+```
+
+This is self-signed, so browsers will show an untrusted-certificate warning unless you import `certs/cert.pem` into your OS/browser trust store — expected for a personal tool, not a bug.
 
 ### Run
 
@@ -148,17 +205,22 @@ docker run -p 127.0.0.1:8080:8080 \
   -e DB_NAME=pubmed_ai \
   -e DB_USER=your_db_user \
   -e DB_PASSWORD=your_db_password \
+  -e JWT_SECRET_KEY=... \
+  -e FLASK_SECRET_KEY=... \
   -e PUBMED_API=your_ncbi_api_key \
   -e LOG_LEVEL=INFO \
   -v $(pwd)/logs:/app/logs \
+  -v $(pwd)/certs:/app/certs \
   pubmed-ai
 ```
+
+`JWT_SECRET_KEY` and `FLASK_SECRET_KEY` are required (generate each with `python -c "import secrets; print(secrets.token_urlsafe(48))"`) — use two different values, since they sign different things on purpose.
 
 `OPENAI_API_KEY`, `OLLAMA_BASE_URL`, and `OLLAMA_API_KEY` are all optional — omit any of them to leave that provider out of the chat model dropdown. `OLLAMA_BASE_URL` (a local server) and `OLLAMA_API_KEY` (Ollama Cloud) are independent and can both be set at once; local Ollama runs on the host, so it needs `host.docker.internal` the same way `DB_HOST` does — Ollama Cloud does not, since it's a public endpoint.
 
 `DB_HOST=host.docker.internal` connects to a PostgreSQL instance running on your Mac. Replace with a hostname or IP if your database is elsewhere.
 
-> **Security note:** `-p 127.0.0.1:8080:8080` binds the published port to the host's loopback only — other machines on your LAN cannot reach the app. Using `-p 8080:8080` (without the IP prefix) would publish on all host interfaces. Flask itself must bind to `0.0.0.0` inside the container for Docker's port forwarding to work; this is safe because the container has its own isolated network namespace.
+> **Security note:** `-p 127.0.0.1:8080:8080` binds the published port to the host's loopback only — other machines on your LAN cannot reach the app. Using `-p 8080:8080` (without the IP prefix) would publish on all host interfaces. gunicorn itself must bind to `0.0.0.0` inside the container for Docker's port forwarding to work; this is safe because the container has its own isolated network namespace.
 
 ---
 
@@ -246,26 +308,35 @@ Logs go to the console and `logs/app.log` (rotating, 10 MB × 5 backups). Verbos
 
 ```
 app.py                   # Flask routes and all business logic
-config.py                # Central configuration — models, prompts, timeouts, limits
+auth.py                  # Password hashing, JWT, login_required(_page), refresh/reset tokens, reset email
+config.py                # Central configuration — models, prompts, timeouts, limits, auth settings
 db.py                    # PostgreSQL / pgvector layer
+wsgi.py                  # gunicorn entrypoint (runs db.init_db(), exposes `application`)
 requirements.txt
 Dockerfile
 .dockerignore
 
+scripts/
+  bootstrap_admin.py     # One-time: create/promote an admin user, reassign pre-auth collections
+
 templates/
-  base.html              # Shared layout (progress bar, breadcrumbs, nav)
+  base.html              # Shared layout (progress bar, CSRF meta tag, account bar, breadcrumbs, nav)
   index.html             # Search + relevance review panel
   collections.html       # Collection list
   collection.html        # Collection detail + 3-column layout (articles | conversations | chat)
+  login.html / register.html
+  forgot_password.html / reset_password.html
 
 static/
-  base.css / base.js     # Shared styles and progress bar
+  base.css / base.js     # Shared styles, progress bar, authFetch() CSRF+silent-refresh wrapper, logout
+  auth.css / auth.js     # Login/register/forgot/reset forms
   index.css / index.js   # Search page and review panel
   collections.css / collections.js
   collection.css / collection.js   # Chat UI, conversation sidebar, history loader
 
 tests/
   test_app.py            # Unit tests — routes, pure functions, helpers (pytest)
+  test_auth.py           # Unit tests — auth.py, /auth/* routes
   test_db.py             # Unit tests — database layer (mocked psycopg2)
 
 logs/
@@ -294,4 +365,4 @@ python app.py
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for the full text.
+GNU Affero General Public License v3.0 (AGPL-3.0-or-later). See [LICENSE](LICENSE) for the full text.

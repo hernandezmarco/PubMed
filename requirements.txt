@@ -1,6 +1,9 @@
 litellm
 flask
 gunicorn
+PyJWT
+flask-wtf
+flask-limiter
 requests
 python-dotenv
 psycopg2-binary

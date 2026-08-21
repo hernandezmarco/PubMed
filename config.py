@@ -33,6 +33,40 @@ OLLAMA_API_KEY    = os.getenv("OLLAMA_API_KEY",    "")
 # streaming chat requests (non-streaming calls return 401 Unauthorized).
 OLLAMA_CLOUD_BASE_URL = "https://ollama.com"
 
+# ── Auth ──────────────────────────────────────────────────────────────────────
+
+JWT_SECRET_KEY          = os.getenv("JWT_SECRET_KEY", "")
+JWT_ACCESS_TTL_MINUTES  = int(os.getenv("JWT_ACCESS_TTL_MINUTES", "30"))
+JWT_REFRESH_TTL_DAYS    = int(os.getenv("JWT_REFRESH_TTL_DAYS", "30"))
+JWT_ALGORITHM           = "HS256"
+
+# Whether auth cookies get the Secure flag (browser will refuse to send them over plain
+# HTTP if set). Defaults on — this app is meant to be served over TLS (see Dockerfile).
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "true").lower() != "false"
+
+# Signs the Flask session cookie that flask-wtf's CSRF token rides on — distinct from
+# JWT_SECRET_KEY on purpose (different subsystems shouldn't share a signing key).
+FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY", "")
+
+# flask-limiter uses in-memory (per-worker) storage — see README for the tradeoff.
+LOGIN_RATE_LIMIT           = os.getenv("LOGIN_RATE_LIMIT",           "5 per minute")
+REGISTER_RATE_LIMIT        = os.getenv("REGISTER_RATE_LIMIT",        "5 per hour")
+FORGOT_PASSWORD_RATE_LIMIT = os.getenv("FORGOT_PASSWORD_RATE_LIMIT", "3 per hour")
+
+PASSWORD_RESET_TTL_MINUTES = int(os.getenv("PASSWORD_RESET_TTL_MINUTES", "60"))
+
+# ── Email (password reset only — registration itself has no verification step) ─
+
+SMTP_HOST     = os.getenv("SMTP_HOST", "")
+SMTP_PORT     = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER     = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM     = os.getenv("SMTP_FROM", "PubMed AI <noreply@localhost>")
+
+# Base URL used to build the password-reset link in the email (e.g. https://host:8080).
+# No trailing slash.
+APP_BASE_URL = os.getenv("APP_BASE_URL", "https://localhost:8080")
+
 # ── Models ────────────────────────────────────────────────────────────────────
 
 QUERY_BUILDER_MODEL     = os.getenv("QUERY_BUILDER_MODEL",     "claude-opus-4-6")

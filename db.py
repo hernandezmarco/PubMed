@@ -58,6 +58,44 @@ def init_db():
         cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
 
         cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id            SERIAL PRIMARY KEY,
+                email         TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                is_active     BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS refresh_tokens (
+                id         SERIAL PRIMARY KEY,
+                user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                token_hash TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                expires_at TIMESTAMPTZ NOT NULL,
+                revoked_at TIMESTAMPTZ
+            )
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS refresh_tokens_user_id_idx ON refresh_tokens(user_id)"
+        )
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                id         SERIAL PRIMARY KEY,
+                user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                token_hash TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                expires_at TIMESTAMPTZ NOT NULL,
+                used_at    TIMESTAMPTZ
+            )
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS password_reset_tokens_user_id_idx ON password_reset_tokens(user_id)"
+        )
+
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS rag_collections (
                 id           SERIAL PRIMARY KEY,
                 name         TEXT NOT NULL,
@@ -66,6 +104,16 @@ def init_db():
                 created_at   TIMESTAMPTZ DEFAULT NOW()
             )
         """)
+        # user_id is nullable at the DB level for now: existing rows predate the users
+        # table and are backfilled by scripts/bootstrap_admin.py, not by this migration.
+        # Application code should always populate it for newly created collections.
+        cur.execute(
+            "ALTER TABLE rag_collections ADD COLUMN IF NOT EXISTS "
+            "user_id INTEGER REFERENCES users(id) ON DELETE CASCADE"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS rag_collections_user_id_idx ON rag_collections(user_id)"
+        )
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS rag_articles (
@@ -126,18 +174,189 @@ def init_db():
         )
 
 
-# ── Write helpers ──────────────────────────────────────────────────────────────
+# ── Users ─────────────────────────────────────────────────────────────────────
 
-def create_collection(name: str, user_query: str, pubmed_query: str) -> int:
+def create_user(email: str, password_hash: str) -> int:
     t0 = time.perf_counter()
     with db_conn() as conn:
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO rag_collections (name, user_query, pubmed_query) VALUES (%s, %s, %s) RETURNING id",
-            (name, user_query, pubmed_query),
+            "INSERT INTO users (email, password_hash) VALUES (%s, %s) RETURNING id",
+            (email, password_hash),
+        )
+        uid = cur.fetchone()[0]
+    _log.info("op=create_user id=%d email=%s duration=%.3fs", uid, email, time.perf_counter() - t0)
+    return uid
+
+
+def get_user_by_email(email: str) -> dict | None:
+    t0 = time.perf_counter()
+    with db_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            "SELECT id, email, password_hash, is_active FROM users WHERE email = %s",
+            (email,),
+        )
+        row = cur.fetchone()
+    result = dict(row) if row else None
+    _log.debug("op=get_user_by_email found=%s duration=%.3fs", result is not None, time.perf_counter() - t0)
+    return result
+
+
+def get_user_by_id(user_id: int) -> dict | None:
+    t0 = time.perf_counter()
+    with db_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            "SELECT id, email, password_hash, is_active FROM users WHERE id = %s",
+            (user_id,),
+        )
+        row = cur.fetchone()
+    result = dict(row) if row else None
+    _log.debug("op=get_user_by_id id=%d found=%s duration=%.3fs", user_id, result is not None, time.perf_counter() - t0)
+    return result
+
+
+def update_user_password(user_id: int, password_hash: str) -> None:
+    t0 = time.perf_counter()
+    with db_conn() as conn:
+        conn.cursor().execute(
+            "UPDATE users SET password_hash = %s WHERE id = %s", (password_hash, user_id)
+        )
+    _log.info("op=update_user_password user_id=%d duration=%.3fs", user_id, time.perf_counter() - t0)
+
+
+def assign_orphaned_collections(user_id: int) -> int:
+    """One-time migration helper: assign every user_id-less collection to user_id. Returns rows updated."""
+    t0 = time.perf_counter()
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE rag_collections SET user_id = %s WHERE user_id IS NULL", (user_id,)
+        )
+        updated = cur.rowcount
+    _log.info(
+        "op=assign_orphaned_collections user_id=%d rows=%d duration=%.3fs",
+        user_id, updated, time.perf_counter() - t0,
+    )
+    return updated
+
+
+# ── Refresh tokens ────────────────────────────────────────────────────────────
+
+def create_refresh_token(user_id: int, token_hash: str, expires_at) -> int:
+    t0 = time.perf_counter()
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES (%s, %s, %s) RETURNING id",
+            (user_id, token_hash, expires_at),
+        )
+        rid = cur.fetchone()[0]
+    _log.info("op=create_refresh_token user_id=%d duration=%.3fs", user_id, time.perf_counter() - t0)
+    return rid
+
+
+def get_valid_refresh_token(token_hash: str) -> dict | None:
+    """Return the refresh_tokens row only if it exists, is unexpired, and unrevoked."""
+    t0 = time.perf_counter()
+    with db_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            """
+            SELECT id, user_id, expires_at
+            FROM refresh_tokens
+            WHERE token_hash = %s AND revoked_at IS NULL AND expires_at > NOW()
+            """,
+            (token_hash,),
+        )
+        row = cur.fetchone()
+    result = dict(row) if row else None
+    _log.debug("op=get_valid_refresh_token found=%s duration=%.3fs", result is not None, time.perf_counter() - t0)
+    return result
+
+
+def revoke_refresh_token(token_hash: str) -> None:
+    t0 = time.perf_counter()
+    with db_conn() as conn:
+        conn.cursor().execute(
+            "UPDATE refresh_tokens SET revoked_at = NOW() WHERE token_hash = %s AND revoked_at IS NULL",
+            (token_hash,),
+        )
+    _log.info("op=revoke_refresh_token duration=%.3fs", time.perf_counter() - t0)
+
+
+def revoke_all_refresh_tokens(user_id: int) -> int:
+    """Revoke every active refresh token for a user — used on password reset ('log out everywhere')."""
+    t0 = time.perf_counter()
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = %s AND revoked_at IS NULL",
+            (user_id,),
+        )
+        revoked = cur.rowcount
+    _log.info("op=revoke_all_refresh_tokens user_id=%d rows=%d duration=%.3fs", user_id, revoked, time.perf_counter() - t0)
+    return revoked
+
+
+# ── Password reset tokens ────────────────────────────────────────────────────
+
+def create_password_reset_token(user_id: int, token_hash: str, expires_at) -> int:
+    t0 = time.perf_counter()
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO password_reset_tokens (user_id, token_hash, expires_at) "
+            "VALUES (%s, %s, %s) RETURNING id",
+            (user_id, token_hash, expires_at),
+        )
+        rid = cur.fetchone()[0]
+    _log.info("op=create_password_reset_token user_id=%d duration=%.3fs", user_id, time.perf_counter() - t0)
+    return rid
+
+
+def get_valid_password_reset_token(token_hash: str) -> dict | None:
+    """Return the password_reset_tokens row only if it exists, is unexpired, and unused."""
+    t0 = time.perf_counter()
+    with db_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            """
+            SELECT id, user_id, expires_at
+            FROM password_reset_tokens
+            WHERE token_hash = %s AND used_at IS NULL AND expires_at > NOW()
+            """,
+            (token_hash,),
+        )
+        row = cur.fetchone()
+    result = dict(row) if row else None
+    _log.debug("op=get_valid_password_reset_token found=%s duration=%.3fs", result is not None, time.perf_counter() - t0)
+    return result
+
+
+def mark_password_reset_token_used(token_id: int) -> None:
+    t0 = time.perf_counter()
+    with db_conn() as conn:
+        conn.cursor().execute(
+            "UPDATE password_reset_tokens SET used_at = NOW() WHERE id = %s", (token_id,)
+        )
+    _log.info("op=mark_password_reset_token_used id=%d duration=%.3fs", token_id, time.perf_counter() - t0)
+
+
+# ── Write helpers ──────────────────────────────────────────────────────────────
+
+def create_collection(name: str, user_query: str, pubmed_query: str, user_id: int) -> int:
+    t0 = time.perf_counter()
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO rag_collections (name, user_query, pubmed_query, user_id) "
+            "VALUES (%s, %s, %s, %s) RETURNING id",
+            (name, user_query, pubmed_query, user_id),
         )
         cid = cur.fetchone()[0]
-    _log.info("op=create_collection id=%d name=%r duration=%.3fs", cid, name, time.perf_counter() - t0)
+    _log.info("op=create_collection id=%d name=%r user_id=%d duration=%.3fs", cid, name, user_id, time.perf_counter() - t0)
     return cid
 
 
@@ -191,7 +410,7 @@ def save_chunks(pmid: str, chunks: list[str], embeddings: list[np.ndarray]):
 
 # ── Read helpers ───────────────────────────────────────────────────────────────
 
-def list_collections() -> list[dict]:
+def list_collections(user_id: int) -> list[dict]:
     t0 = time.perf_counter()
     with db_conn() as conn:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -204,15 +423,17 @@ def list_collections() -> list[dict]:
             FROM rag_collections c
             LEFT JOIN rag_articles    a  ON a.collection_id = c.id
             LEFT JOIN article_chunks  ac ON ac.pmid = a.pmid
+            WHERE c.user_id = %s
             GROUP BY c.id
             ORDER BY c.created_at DESC
-        """)
+        """, (user_id,))
         rows = [dict(r) for r in cur.fetchall()]
-    _log.info("op=list_collections rows=%d duration=%.3fs", len(rows), time.perf_counter() - t0)
+    _log.info("op=list_collections user_id=%d rows=%d duration=%.3fs", user_id, len(rows), time.perf_counter() - t0)
     return rows
 
 
-def get_collection(cid: int) -> dict | None:
+def get_collection(cid: int, user_id: int) -> dict | None:
+    """Return the collection only if it exists AND is owned by user_id."""
     t0 = time.perf_counter()
     with db_conn() as conn:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -225,12 +446,12 @@ def get_collection(cid: int) -> dict | None:
             FROM rag_collections c
             LEFT JOIN rag_articles    a  ON a.collection_id = c.id
             LEFT JOIN article_chunks  ac ON ac.pmid = a.pmid
-            WHERE c.id = %s
+            WHERE c.id = %s AND c.user_id = %s
             GROUP BY c.id
-        """, (cid,))
+        """, (cid, user_id))
         row = cur.fetchone()
     result = dict(row) if row else None
-    _log.info("op=get_collection cid=%d found=%s duration=%.3fs", cid, result is not None, time.perf_counter() - t0)
+    _log.info("op=get_collection cid=%d user_id=%d found=%s duration=%.3fs", cid, user_id, result is not None, time.perf_counter() - t0)
     return result
 
 
@@ -279,11 +500,13 @@ def semantic_search(cid: int, embedding: np.ndarray, k: int = 5) -> list[dict]:
     return rows
 
 
-def delete_collection(cid: int):
+def delete_collection(cid: int, user_id: int):
     t0 = time.perf_counter()
     with db_conn() as conn:
-        conn.cursor().execute("DELETE FROM rag_collections WHERE id = %s", (cid,))
-    _log.info("op=delete_collection cid=%d duration=%.3fs", cid, time.perf_counter() - t0)
+        conn.cursor().execute(
+            "DELETE FROM rag_collections WHERE id = %s AND user_id = %s", (cid, user_id)
+        )
+    _log.info("op=delete_collection cid=%d user_id=%d duration=%.3fs", cid, user_id, time.perf_counter() - t0)
 
 
 # ── Conversation helpers ───────────────────────────────────────────────────────
@@ -334,13 +557,14 @@ def list_conversations(cid: int) -> list[dict]:
 
 
 def get_conversation(vid: int) -> dict | None:
+    """Includes the owning collection's user_id so callers can check ownership."""
     t0 = time.perf_counter()
     with db_conn() as conn:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute(
             """
-            SELECT v.id, v.title, v.created_at::text AS created_at,
-                   c.name AS collection_name
+            SELECT v.id, v.title, v.created_at::text AS created_at, v.collection_id,
+                   c.name AS collection_name, c.user_id AS user_id
             FROM conversations v
             JOIN rag_collections c ON c.id = v.collection_id
             WHERE v.id = %s

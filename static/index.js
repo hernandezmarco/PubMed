@@ -169,7 +169,7 @@ async function saveCollection() {
   _initSaveUI();
 
   try {
-    const res = await fetch('/collections/save-stream', {
+    const res = await authFetch('/collections/save-stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name, user_query: USER_QUERY, pubmed_query: PUBMED_QUERY, articles: selectedArticles }),

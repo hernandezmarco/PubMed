@@ -80,6 +80,9 @@ _SSE_MIMETYPE = "text/event-stream"
 
 app = Flask(__name__)
 app.jinja_env.globals["static_version"] = cfg.STATIC_VERSION
+# No CSRF protection (flask-wtf): no session/cookie-based auth exists anywhere in this
+# app, so there's no ambient credential for a forged cross-site request to ride. Revisit
+# if login/session auth is ever added.
 
 # ── Available models (resolved once at first request) ─────────────────────────
 
@@ -1271,4 +1274,4 @@ def conversation_export(vid: int):
 
 if __name__ == "__main__":
     db.init_db()
-    app.run(host="0.0.0.0", debug=True, port=8080)
+    app.run(host="127.0.0.1", debug=True, port=8080)

@@ -15,8 +15,10 @@
 #
 #  A few notes:
 #  - -p 127.0.0.1:8080:8080 — binds the published port to the host loopback only; other machines on your LAN cannot reach it.
-#    Flask must bind to 0.0.0.0 inside the container (see app.py) for Docker's forwarding to work — this is safe
+#    gunicorn must bind to 0.0.0.0 inside the container (see CMD below) for Docker's forwarding to work — this is safe
 #    because the container has its own isolated network namespace.
+#  - Serving — gunicorn (wsgi:application), not the Flask dev server. `python app.py` (Werkzeug's dev server, with its
+#    interactive debugger) is for local development only — see CLAUDE.md.
 #  - libgomp1 — the only system dep needed; onnxruntime (fastembed's backend) requires it at runtime on Debian slim images
 #  - Model pre-baked — BAAI/bge-small-en-v1.5 is downloaded during docker build so the container starts immediately without a model download delay
 #  - -v $(pwd)/logs:/app/logs — mounts the log directory as a volume so logs survive container restarts
@@ -54,4 +56,4 @@ COPY . .
 
 EXPOSE 8080
 
-CMD ["python", "app.py"]
+CMD ["gunicorn", "-b", "0.0.0.0:8080", "-w", "4", "wsgi:application"]

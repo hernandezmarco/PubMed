@@ -1,5 +1,6 @@
 litellm
 flask
+gunicorn
 requests
 python-dotenv
 psycopg2-binary

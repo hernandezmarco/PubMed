@@ -40,6 +40,7 @@
           value="{{ user_query | e }}"
           autofocus
         >
+        <label class="visually-hidden" for="max-results">Number of results</label>
         <select id="max-results" name="max_results" class="select-results">
           {% for n in range(25, 201, 25) %}
           <option value="{{ n }}" {% if n == (max_results or 25) %}selected{% endif %}>{{ n }} results</option>
@@ -100,7 +101,7 @@
     </div>
 
     <div class="save-controls-row">
-      <input id="col-name" type="text" placeholder="Collection name…" maxlength="80">
+      <input id="col-name" type="text" aria-label="Collection name" placeholder="Collection name…" maxlength="80">
       <button id="btn-save" class="btn-save">Save as RAG Collection</button>
       <span id="save-status"></span>
     </div>

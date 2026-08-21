@@ -37,7 +37,7 @@ def _make_conn(rows=None, rowcount=1):
     return conn, cur
 
 
-@pytest.fixture()
+@pytest.fixture
 def mock_conn():
     """Patch db._connect so db_conn() never touches Postgres."""
     conn, cur = _make_conn()
@@ -46,6 +46,11 @@ def mock_conn():
 
 
 # ── db_conn context manager ───────────────────────────────────────────────────
+
+def _raise_inside_db_conn(exc: Exception):
+    with db.db_conn():
+        raise exc
+
 
 class TestDbConn:
     def test_commits_on_success(self):
@@ -60,8 +65,7 @@ class TestDbConn:
         conn, _ = _make_conn()
         with patch("db._connect", return_value=conn):
             with pytest.raises(ValueError):
-                with db.db_conn():
-                    raise ValueError("boom")
+                _raise_inside_db_conn(ValueError("boom"))
         conn.rollback.assert_called_once()
         conn.commit.assert_not_called()
 
@@ -69,8 +73,7 @@ class TestDbConn:
         conn, _ = _make_conn()
         with patch("db._connect", return_value=conn):
             with pytest.raises(RuntimeError):
-                with db.db_conn():
-                    raise RuntimeError("err")
+                _raise_inside_db_conn(RuntimeError("err"))
         conn.close.assert_called_once()
 
     def test_connection_closed_on_success_too(self):

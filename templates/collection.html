@@ -90,9 +90,11 @@
 
     <div class="chat-input-bar">
       <input id="question" type="text"
+             aria-label="Ask a question about this collection"
              placeholder="e.g. What are the main findings on sleep and memory consolidation?"
              autocomplete="off">
-      <select id="model-select" class="model-select" aria-label="Select model" title="Select model"></select>
+      <label class="visually-hidden" for="model-select">Select model</label>
+      <select id="model-select" class="model-select" title="Select model"></select>
       <button class="btn-ask" id="btn-ask">Ask</button>
     </div>
   </div>
@@ -103,6 +105,8 @@
 <script>
 const COLLECTION_ID = {{ collection.id }};
 </script>
-<script src="https://cdn.jsdelivr.net/npm/marked@9/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@9.1.6/marked.min.js"
+        integrity="sha384-odPBjvtXVM/5hOYIr3A1dB+flh0c3wAT3bSesIOqEGmyUA4JoKf/YTWy0XKOYAY7"
+        crossorigin="anonymous"></script>
 <script type="module" src="{{ url_for('static', filename='collection.js') }}?v={{ static_version }}"></script>
 {% endblock %}

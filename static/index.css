@@ -77,7 +77,7 @@
 .query-badge code {
   display: block;
   margin-top: 0.25rem;
-  word-break: break-word;
+  overflow-wrap: break-word;
   font-family: "SFMono-Regular", Consolas, monospace;
   font-size: 0.82rem;
   color: #333;

@@ -27,7 +27,9 @@ Searching PubMed manually requires knowing MeSH terms, Boolean operators, and fi
 |---|---|
 | Python 3.11 | Tested on 3.11; 3.12 may work |
 | PostgreSQL 14+ with pgvector | `CREATE EXTENSION vector;` must be run in your database |
-| Anthropic API key | [console.anthropic.com](https://console.anthropic.com) |
+| Anthropic API key | [console.anthropic.com](https://console.anthropic.com) — required |
+| OpenAI API key | [platform.openai.com](https://platform.openai.com) — optional, adds OpenAI models to the chat dropdown |
+| Ollama | [ollama.com](https://ollama.com) — optional, adds locally-run and/or cloud-hosted models to the chat dropdown |
 | Docker (optional) | Only needed for container deployment |
 
 ### Install pgvector
@@ -71,6 +73,17 @@ Create a `.env` file in the project root:
 
 ```dotenv
 ANTHROPIC_API_KEY=sk-ant-...
+
+# Optional — enables OpenAI models in the chat model dropdown
+OPENAI_API_KEY=sk-...
+
+# Optional — local Ollama server for the chat model dropdown; defaults to
+# http://localhost:11434 and is auto-detected (silently skipped if unreachable)
+OLLAMA_BASE_URL=http://localhost:11434
+
+# Optional — Ollama Cloud (https://ollama.com) key. Adds your account's hosted
+# model catalog to the chat model dropdown, independent of OLLAMA_BASE_URL.
+OLLAMA_API_KEY=your_ollama_cloud_api_key
 
 DB_HOST=localhost
 DB_NAME=pubmed_ai
@@ -128,6 +141,9 @@ docker build -t pubmed-ai .
 ```bash
 docker run -p 127.0.0.1:8080:8080 \
   -e ANTHROPIC_API_KEY=sk-ant-... \
+  -e OPENAI_API_KEY=sk-... \
+  -e OLLAMA_BASE_URL=http://host.docker.internal:11434 \
+  -e OLLAMA_API_KEY=your_ollama_cloud_api_key \
   -e DB_HOST=host.docker.internal \
   -e DB_NAME=pubmed_ai \
   -e DB_USER=your_db_user \
@@ -137,6 +153,8 @@ docker run -p 127.0.0.1:8080:8080 \
   -v $(pwd)/logs:/app/logs \
   pubmed-ai
 ```
+
+`OPENAI_API_KEY`, `OLLAMA_BASE_URL`, and `OLLAMA_API_KEY` are all optional — omit any of them to leave that provider out of the chat model dropdown. `OLLAMA_BASE_URL` (a local server) and `OLLAMA_API_KEY` (Ollama Cloud) are independent and can both be set at once; local Ollama runs on the host, so it needs `host.docker.internal` the same way `DB_HOST` does — Ollama Cloud does not, since it's a public endpoint.
 
 `DB_HOST=host.docker.internal` connects to a PostgreSQL instance running on your Mac. Replace with a hostname or IP if your database is elsewhere.
 
@@ -173,6 +191,7 @@ Flask (app.py)
   │     ├── Claude (selectable)     ──►  Streamed cited answer + 4 follow-up suggestions
   │     └── db.add_message()        ──►  Persist user + assistant messages
   │
+  ├── GET  /api/models                           List available chat models (Anthropic/OpenAI + discovered Ollama local/cloud)
   ├── GET  /collections/<id>/starter-questions   Generate starter questions (cached, async)
   ├── GET  /collections/<id>/export.csv          Download article metadata as CSV
   ├── GET  /collections/<id>/conversations       List saved conversations
@@ -196,7 +215,9 @@ Database (PostgreSQL + pgvector)
 
 `BAAI/bge-small-en-v1.5` (384-dimensional vectors) via [fastembed](https://github.com/qdrant/fastembed). Used for both indexing article chunks and embedding queries at search/ask time.
 
-### Claude models
+### Chat models
+
+All Claude calls go through [litellm](https://github.com/BerriAI/litellm), which routes by model-ID prefix to Anthropic, OpenAI, a local Ollama server, or Ollama Cloud — no code changes needed to add a provider, only credentials/config.
 
 | Task | Default model | Override env var |
 |---|---|---|
@@ -204,7 +225,14 @@ Database (PostgreSQL + pgvector)
 | Starter question generation | `claude-opus-4-6` | `STARTER_QUESTIONS_MODEL` |
 | Collection chat | `claude-opus-4-6` | `DEFAULT_CHAT_MODEL` |
 
-The chat model can also be switched at runtime from the collection page (Opus 4.6 / Sonnet 4.6 / Haiku 4.5); the preference is persisted in `localStorage`.
+> Query generation and starter questions make a single non-streaming call, so they only support Claude. Ollama Cloud rejects non-streaming chat requests (401 Unauthorized) — only the collection-chat path streams, so it's the only place Ollama (local or cloud) models are usable.
+
+The collection-chat model can also be switched at runtime from the collection page. The dropdown is populated live from `GET /api/models`, which lists:
+- Anthropic/OpenAI models from `cfg.CHAT_MODELS` (config.py) whose `requires_key` env var is set,
+- any models currently pulled in a locally reachable Ollama server (`OLLAMA_BASE_URL`, default `http://localhost:11434`), discovered via `/api/tags` on every request — so `ollama pull <model>` shows up without restarting the app, and
+- if `OLLAMA_API_KEY` is set, your Ollama Cloud account's hosted model catalog (`https://ollama.com/api/tags`, bearer-authenticated) — a fixed list of models available to your account, not something you "pull." Labeled "Ollama (cloud)" in the dropdown to distinguish it from the local server.
+
+The selected model preference is persisted in `localStorage`. Ollama models (local and cloud) are always shown as `$0.00` in the usage footer — local genuinely is free, but Ollama Cloud usage is actually metered by Ollama on their end; this app just doesn't track/display that cost.
 
 All tunable values — model IDs, system prompts, timeouts, chunk sizes, token limits — live in `config.py`.
 

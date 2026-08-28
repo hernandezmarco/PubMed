@@ -97,13 +97,13 @@ DB_PASSWORD=your_db_password
 JWT_SECRET_KEY=
 FLASK_SECRET_KEY=
 
-# Optional — password reset emails. Unset = the reset token is still created but no
-# email is sent (logged, not an error) — fine for local dev.
-SMTP_HOST=
-SMTP_PORT=587
-SMTP_USER=
-SMTP_PASSWORD=
-SMTP_FROM=PubMed AI <noreply@localhost>
+# SMTP2GO HTTP API key — sends the account-verification and password-reset emails.
+# Registration requires clicking the verification link before the account can log
+# in; unset just means the token is still created but the email never arrives
+# (logged, not an error) — fine for local dev, but you'll need to verify the
+# account directly in the DB to log in.
+SMTP2GO_API=
+EMAIL_FROM=PubMed AI <noreply@localhost>
 APP_BASE_URL=http://127.0.0.1:8080
 
 # Optional — NCBI E-utilities API key (raises rate limit 3 → 10 req/s)
@@ -138,7 +138,7 @@ createdb pubmed_ai
 python app.py
 ```
 
-Open [http://127.0.0.1:8080](http://127.0.0.1:8080). Every page requires an account — register one at `/register`, or run `python -m scripts.bootstrap_admin` to create/promote a specific account (it also reassigns any pre-auth collections, `user_id IS NULL`, to that account).
+Open [http://127.0.0.1:8080](http://127.0.0.1:8080). Every page requires an account — register one at `/register` and click the verification link emailed to you before you can log in, or run `python -m scripts.bootstrap_admin` to create/promote a specific account (auto-verified, skips the email step; it also reassigns any pre-auth collections, `user_id IS NULL`, to that account).
 
 The first search will download the `BAAI/bge-small-en-v1.5` embedding model (~130 MB) into `~/.cache/fastembed`. Subsequent starts are instant.
 
@@ -163,12 +163,12 @@ The first search will download the `BAAI/bge-small-en-v1.5` embedding model (~13
 | `LOGIN_RATE_LIMIT` | `5 per minute` | Rate limit on `POST /auth/login`. |
 | `REGISTER_RATE_LIMIT` | `5 per hour` | Rate limit on `POST /auth/register`. |
 | `FORGOT_PASSWORD_RATE_LIMIT` | `3 per hour` | Rate limit on `POST /auth/forgot-password`. |
+| `RESEND_VERIFICATION_RATE_LIMIT` | `3 per hour` | Rate limit on `POST /auth/resend-verification`. |
 | `PASSWORD_RESET_TTL_MINUTES` | `60` | How long a password-reset link stays valid. |
-| `SMTP_HOST` | *(empty)* | Optional. Enables password-reset emails; unset just skips sending (the reset token is still created — logged, not an error). |
-| `SMTP_PORT` | `587` | SMTP port (STARTTLS). |
-| `SMTP_USER` / `SMTP_PASSWORD` | — | Optional SMTP auth. |
-| `SMTP_FROM` | `PubMed AI <noreply@localhost>` | From address on reset emails. |
-| `APP_BASE_URL` | `https://localhost:8080` | Base URL used to build the link in reset emails. |
+| `EMAIL_VERIFICATION_TTL_MINUTES` | `1440` | How long a new-account verification link stays valid (default 24h). |
+| `SMTP2GO_API` | *(empty)* | API key for [SMTP2GO](https://www.smtp2go.com/)'s HTTP send API. Sends both verification and password-reset emails; unset just skips sending (the token is still created — logged, not an error), so accounts stay unverified and can't log in until verified directly in the DB. |
+| `EMAIL_FROM` | `PubMed AI <noreply@localhost>` | From address on verification/reset emails. Must be a sender/domain verified in your SMTP2GO account. |
+| `APP_BASE_URL` | `https://localhost:8080` | Base URL used to build the verification/reset links in emails. |
 
 ---
 
@@ -176,22 +176,22 @@ The first search will download the `BAAI/bge-small-en-v1.5` embedding model (~13
 
 The Docker image pre-bakes the embedding model so there is no download delay on startup. The container is served by **gunicorn over TLS**, not the Flask dev server.
 
-### Build
-
-```bash
-docker build -t pubmed-ai .
-```
-
 ### Generate a TLS certificate
 
-Required once before running — gunicorn's `CMD` expects `certs/cert.pem` and `certs/key.pem` to exist:
+Required once, **before building the image** — `certs/cert.pem` and `certs/key.pem` get baked into the image (`COPY . .`, not excluded by `.dockerignore`) so gunicorn's `--certfile`/`--keyfile` can find them without a runtime bind-mount:
 
 ```bash
 mkdir -p certs
 openssl req -x509 -newkey rsa:4096 -nodes -keyout certs/key.pem -out certs/cert.pem -days 365 -subj "/CN=localhost"
 ```
 
-This is self-signed, so browsers will show an untrusted-certificate warning unless you import `certs/cert.pem` into your OS/browser trust store — expected for a personal tool, not a bug.
+This is self-signed, so browsers will show an untrusted-certificate warning unless you import `certs/cert.pem` into your OS/browser trust store — expected for a personal tool, not a bug. Rebuild the image any time you regenerate the cert. Because the private key is now part of the image, never push it to a registry or otherwise share it — `certs/` still stays out of git via `.gitignore`.
+
+### Build
+
+```bash
+docker build -t pubmed-ai .
+```
 
 ### Run
 
@@ -207,10 +207,10 @@ docker run -p 127.0.0.1:8080:8080 \
   -e DB_PASSWORD=your_db_password \
   -e JWT_SECRET_KEY=... \
   -e FLASK_SECRET_KEY=... \
+  -e SMTP2GO_API=api-... \
   -e PUBMED_API=your_ncbi_api_key \
   -e LOG_LEVEL=INFO \
   -v $(pwd)/logs:/app/logs \
-  -v $(pwd)/certs:/app/certs \
   pubmed-ai
 ```
 

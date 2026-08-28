@@ -6,7 +6,6 @@ __pycache__/
 *.pyc
 *.pyo
 .env
-certs/
 logs/
 CLAUDE.md
 test-results

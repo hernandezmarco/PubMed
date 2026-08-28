@@ -49,22 +49,25 @@ COOKIE_SECURE = os.getenv("COOKIE_SECURE", "true").lower() != "false"
 FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY", "")
 
 # flask-limiter uses in-memory (per-worker) storage — see README for the tradeoff.
-LOGIN_RATE_LIMIT           = os.getenv("LOGIN_RATE_LIMIT",           "5 per minute")
-REGISTER_RATE_LIMIT        = os.getenv("REGISTER_RATE_LIMIT",        "5 per hour")
-FORGOT_PASSWORD_RATE_LIMIT = os.getenv("FORGOT_PASSWORD_RATE_LIMIT", "3 per hour")
+LOGIN_RATE_LIMIT                = os.getenv("LOGIN_RATE_LIMIT",                "5 per minute")
+REGISTER_RATE_LIMIT             = os.getenv("REGISTER_RATE_LIMIT",             "5 per hour")
+FORGOT_PASSWORD_RATE_LIMIT      = os.getenv("FORGOT_PASSWORD_RATE_LIMIT",      "3 per hour")
+RESEND_VERIFICATION_RATE_LIMIT  = os.getenv("RESEND_VERIFICATION_RATE_LIMIT",  "3 per hour")
 
-PASSWORD_RESET_TTL_MINUTES = int(os.getenv("PASSWORD_RESET_TTL_MINUTES", "60"))
+PASSWORD_RESET_TTL_MINUTES      = int(os.getenv("PASSWORD_RESET_TTL_MINUTES",      "60"))
+EMAIL_VERIFICATION_TTL_MINUTES  = int(os.getenv("EMAIL_VERIFICATION_TTL_MINUTES",  "1440"))
 
-# ── Email (password reset only — registration itself has no verification step) ─
+# ── Email (SMTP2GO HTTP API — https://api.smtp2go.com/v3/email/send) ──────────
+# Registration requires clicking the emailed link before the account can log in;
+# SMTP2GO_API unset just means the account is created but the email never
+# arrives (logged, not an error) — fine for local dev, sign in blocked until an
+# admin verifies the row directly.
 
-SMTP_HOST     = os.getenv("SMTP_HOST", "")
-SMTP_PORT     = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER     = os.getenv("SMTP_USER", "")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-SMTP_FROM     = os.getenv("SMTP_FROM", "PubMed AI <noreply@localhost>")
+SMTP2GO_API = os.getenv("SMTP2GO_API", "")
+EMAIL_FROM  = os.getenv("EMAIL_FROM", "PubMed AI <noreply@localhost>")
 
-# Base URL used to build the password-reset link in the email (e.g. https://host:8080).
-# No trailing slash.
+# Base URL used to build the verification / password-reset links in emails
+# (e.g. https://host:8080). No trailing slash.
 APP_BASE_URL = os.getenv("APP_BASE_URL", "https://localhost:8080")
 
 # ── Models ────────────────────────────────────────────────────────────────────

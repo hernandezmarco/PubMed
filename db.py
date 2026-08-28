@@ -59,13 +59,16 @@ def init_db():
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                id            SERIAL PRIMARY KEY,
-                email         TEXT UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL,
-                is_active     BOOLEAN NOT NULL DEFAULT TRUE,
-                created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                id             SERIAL PRIMARY KEY,
+                email          TEXT UNIQUE NOT NULL,
+                password_hash  TEXT NOT NULL,
+                is_active      BOOLEAN NOT NULL DEFAULT TRUE,
+                email_verified BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
+        # Migrate existing tables that pre-date this column
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE")
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS refresh_tokens (
@@ -93,6 +96,21 @@ def init_db():
         """)
         cur.execute(
             "CREATE INDEX IF NOT EXISTS password_reset_tokens_user_id_idx ON password_reset_tokens(user_id)"
+        )
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS email_verification_tokens (
+                id         SERIAL PRIMARY KEY,
+                user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                token_hash TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                expires_at TIMESTAMPTZ NOT NULL,
+                used_at    TIMESTAMPTZ
+            )
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS email_verification_tokens_user_id_idx "
+            "ON email_verification_tokens(user_id)"
         )
 
         cur.execute("""
@@ -194,7 +212,7 @@ def get_user_by_email(email: str) -> dict | None:
     with db_conn() as conn:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute(
-            "SELECT id, email, password_hash, is_active FROM users WHERE email = %s",
+            "SELECT id, email, password_hash, is_active, email_verified FROM users WHERE email = %s",
             (email,),
         )
         row = cur.fetchone()
@@ -208,7 +226,7 @@ def get_user_by_id(user_id: int) -> dict | None:
     with db_conn() as conn:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute(
-            "SELECT id, email, password_hash, is_active FROM users WHERE id = %s",
+            "SELECT id, email, password_hash, is_active, email_verified FROM users WHERE id = %s",
             (user_id,),
         )
         row = cur.fetchone()
@@ -224,6 +242,15 @@ def update_user_password(user_id: int, password_hash: str) -> None:
             "UPDATE users SET password_hash = %s WHERE id = %s", (password_hash, user_id)
         )
     _log.info("op=update_user_password user_id=%d duration=%.3fs", user_id, time.perf_counter() - t0)
+
+
+def mark_user_verified(user_id: int) -> None:
+    t0 = time.perf_counter()
+    with db_conn() as conn:
+        conn.cursor().execute(
+            "UPDATE users SET email_verified = TRUE WHERE id = %s", (user_id,)
+        )
+    _log.info("op=mark_user_verified user_id=%d duration=%.3fs", user_id, time.perf_counter() - t0)
 
 
 def assign_orphaned_collections(user_id: int) -> int:
@@ -342,6 +369,50 @@ def mark_password_reset_token_used(token_id: int) -> None:
             "UPDATE password_reset_tokens SET used_at = NOW() WHERE id = %s", (token_id,)
         )
     _log.info("op=mark_password_reset_token_used id=%d duration=%.3fs", token_id, time.perf_counter() - t0)
+
+
+# ── Email verification tokens ────────────────────────────────────────────────
+
+def create_email_verification_token(user_id: int, token_hash: str, expires_at) -> int:
+    t0 = time.perf_counter()
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO email_verification_tokens (user_id, token_hash, expires_at) "
+            "VALUES (%s, %s, %s) RETURNING id",
+            (user_id, token_hash, expires_at),
+        )
+        rid = cur.fetchone()[0]
+    _log.info("op=create_email_verification_token user_id=%d duration=%.3fs", user_id, time.perf_counter() - t0)
+    return rid
+
+
+def get_valid_email_verification_token(token_hash: str) -> dict | None:
+    """Return the email_verification_tokens row only if it exists, is unexpired, and unused."""
+    t0 = time.perf_counter()
+    with db_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            """
+            SELECT id, user_id, expires_at
+            FROM email_verification_tokens
+            WHERE token_hash = %s AND used_at IS NULL AND expires_at > NOW()
+            """,
+            (token_hash,),
+        )
+        row = cur.fetchone()
+    result = dict(row) if row else None
+    _log.debug("op=get_valid_email_verification_token found=%s duration=%.3fs", result is not None, time.perf_counter() - t0)
+    return result
+
+
+def mark_email_verification_token_used(token_id: int) -> None:
+    t0 = time.perf_counter()
+    with db_conn() as conn:
+        conn.cursor().execute(
+            "UPDATE email_verification_tokens SET used_at = NOW() WHERE id = %s", (token_id,)
+        )
+    _log.info("op=mark_email_verification_token_used id=%d duration=%.3fs", token_id, time.perf_counter() - t0)
 
 
 # ── Write helpers ──────────────────────────────────────────────────────────────

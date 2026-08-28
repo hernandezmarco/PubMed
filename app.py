@@ -526,6 +526,16 @@ def _issue_auth_cookies(user_id: int) -> Response:
     return resp
 
 
+def _send_verification(user_id: int, email: str) -> None:
+    """Create a fresh email-verification token and email the confirmation link."""
+    raw_token = secrets.token_urlsafe(32)
+    expires = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+        minutes=cfg.EMAIL_VERIFICATION_TTL_MINUTES
+    )
+    db.create_email_verification_token(user_id, auth.hash_token(raw_token), expires)
+    auth.send_verification_email(email, raw_token)
+
+
 @app.route("/login", methods=["GET"])
 def login_page():
     return render_template("login.html")
@@ -534,6 +544,18 @@ def login_page():
 @app.route("/register", methods=["GET"])
 def register_page():
     return render_template("register.html")
+
+
+@app.route("/verify-email", methods=["GET"])
+def verify_email_page():
+    raw_token = request.args.get("token", "")
+    valid = db.get_valid_email_verification_token(auth.hash_token(raw_token)) if raw_token else None
+    if not valid:
+        return render_template("verify_email.html", success=False)
+
+    db.mark_user_verified(valid["user_id"])
+    db.mark_email_verification_token_used(valid["id"])
+    return render_template("verify_email.html", success=True)
 
 
 @app.route("/auth/register", methods=["POST"])
@@ -551,7 +573,11 @@ def auth_register():
         return jsonify({"error": "An account with that email already exists."}), 409
 
     user_id = db.create_user(email, auth.hash_password(password))
-    return _issue_auth_cookies(user_id)
+    _send_verification(user_id, email)
+    return jsonify({
+        "ok": True,
+        "message": "Check your email for a link to verify your account before logging in.",
+    })
 
 
 @app.route("/auth/login", methods=["POST"])
@@ -564,8 +590,33 @@ def auth_login():
     user = db.get_user_by_email(email)
     if not user or not user["is_active"] or not auth.verify_password(password, user["password_hash"]):
         return jsonify({"error": "Invalid email or password."}), 401
+    if not user["email_verified"]:
+        return jsonify({
+            "error": "Please verify your email before logging in.",
+            "code": "email_not_verified",
+        }), 403
 
     return _issue_auth_cookies(user["id"])
+
+
+@app.route("/auth/resend-verification", methods=["POST"])
+@limiter.limit(cfg.RESEND_VERIFICATION_RATE_LIMIT)
+def auth_resend_verification():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+
+    # Always return the same generic response whether or not the account exists/is
+    # already verified — otherwise this endpoint becomes an email-enumeration oracle.
+    generic_response = jsonify({
+        "ok": True,
+        "message": "If an unverified account with that email exists, a new link has been sent.",
+    })
+
+    user = db.get_user_by_email(email) if email else None
+    if user and user["is_active"] and not user["email_verified"]:
+        _send_verification(user["id"], user["email"])
+
+    return generic_response
 
 
 @app.route("/auth/refresh", methods=["POST"])
@@ -760,29 +811,31 @@ def _save_fetch_phase(articles: list[dict], pmcid_map: dict):
     return fetched, counts
 
 
-def _save_persist_phase(cid: int, fetched: list) -> list[tuple[str, list[str]]]:
-    """Insert article rows; return (pmid, chunks) pairs that still need embedding."""
-    pending: list[tuple[str, list[str]]] = []
+def _save_persist_phase(cid: int, fetched: list) -> list[tuple[str, list[str], bool]]:
+    """Insert article rows; return (pmid, chunks, is_full_text) triples that still need embedding."""
+    pending: list[tuple[str, list[str], bool]] = []
     for art, full_text, pmcid in fetched:
         db.add_article(cid, art, has_full_text=bool(full_text), pmcid=pmcid)
         pmid = art["pmid"]
         if not db.chunks_exist(pmid):
             text_to_chunk = full_text or f"{art['title']}. {art['abstract']}"
-            pending.append((pmid, chunk_text(text_to_chunk, cfg.CHUNK_SIZE, cfg.CHUNK_OVERLAP)))
+            chunks = chunk_text(text_to_chunk, cfg.CHUNK_SIZE, cfg.CHUNK_OVERLAP)
+            pending.append((pmid, chunks, bool(full_text)))
     return pending
 
 
-def _save_embed_phase(pending: list[tuple[str, list[str]]], counts: dict):
+def _save_embed_phase(pending: list[tuple[str, list[str], bool]]):
     """Generator — yields SSE embedding event then embeds and saves all pending chunks."""
     if not pending:
         return
+    full_text_count = sum(1 for _, _, is_full_text in pending if is_full_text)
     yield _sse({"type": "embedding", "count": len(pending),
-                "full_text": counts["full_text"],
-                "abstract": counts["abstract"] + counts["fallback"]})
-    all_chunks = [c for _, chunks in pending for c in chunks]
+                "full_text": full_text_count,
+                "abstract": len(pending) - full_text_count})
+    all_chunks = [c for _, chunks, _ in pending for c in chunks]
     all_embeddings = embed_texts(all_chunks)
     offset = 0
-    for pmid, chunks in pending:
+    for pmid, chunks, _ in pending:
         n = len(chunks)
         db.save_chunks(pmid, chunks, all_embeddings[offset:offset + n])
         offset += n
@@ -810,7 +863,7 @@ def collections_save_stream():
             cid = db.create_collection(name, user_query, pubmed_query, user_id)
             fetched, counts = yield from _save_fetch_phase(articles, pmcid_map)
             pending = _save_persist_phase(cid, fetched)
-            yield from _save_embed_phase(pending, counts)
+            yield from _save_embed_phase(pending)
             yield _sse({"type": "done", "id": cid, "count": len(articles), **counts})
         except Exception as exc:
             yield _sse({"type": "error", "message": str(exc)})

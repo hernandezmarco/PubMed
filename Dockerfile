@@ -1,3 +1,8 @@
+# Build — generate certs/{cert.pem,key.pem} FIRST (see CLAUDE.md); they're baked into
+# the image (COPY . . below, not excluded by .dockerignore) so gunicorn can terminate
+# TLS without a runtime bind-mount. Rebuild the image if you regenerate the cert.
+# Never push/share this image publicly — it contains the TLS private key.
+#
 # Run — pass all required env vars at runtime (never bake secrets into the image)
 
 #  docker run -p 127.0.0.1:8080:8080 \
@@ -56,4 +61,14 @@ COPY . .
 
 EXPOSE 8080
 
-CMD ["gunicorn", "-b", "0.0.0.0:8080", "-w", "4", "wsgi:application"]
+# --timeout 300 — gunicorn's default (30s) kills+respawns a worker (SIGKILL, logged as
+# "WORKER TIMEOUT" / "Perhaps out of memory?" — that message is boilerplate, not a real
+# OOM diagnosis) if it goes quiet mid-request. Saving a large collection (up to
+# MAX_RESULTS_MAX=200 articles: PMC full-text fetches + chunk embedding, all synchronous
+# in one request) routinely exceeds 30s.
+# --certfile/--keyfile — terminate TLS in gunicorn itself, using certs/{cert.pem,key.pem}
+# baked into the image by COPY . . above (generate them per CLAUDE.md BEFORE running
+# docker build, or the worker fails to boot with a missing-file error). Required:
+# COOKIE_SECURE defaults to true (auth cookies marked Secure), which browsers silently
+# refuse to store/send over a plain-HTTP connection.
+CMD ["gunicorn", "-b", "0.0.0.0:8080", "-w", "4", "--timeout", "300", "--certfile", "/app/certs/cert.pem", "--keyfile", "/app/certs/key.pem", "wsgi:application"]

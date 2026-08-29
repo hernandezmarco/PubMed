@@ -1,0 +1,85 @@
+/*
+ * Copyright (C) 2025 Marco Hernandez <ragettyandy@gmail.com>
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU Affero General Public License for more details.
+ *
+ * For information contact Marco Hernandez <ragettyandy@gmail.com>
+ */
+
+.auth-card {
+  max-width: 380px;
+  margin: 3rem auto;
+  background: #fff;
+  border-radius: 10px;
+  padding: 2rem;
+  box-shadow: 0 2px 8px rgba(0,0,0,.08);
+}
+.auth-card h1 { font-size: 1.3rem; margin-bottom: 1.25rem; color: #1a1a2e; }
+
+.auth-field { margin-bottom: 1rem; }
+.auth-field label {
+  display: block;
+  font-weight: 600;
+  font-size: 0.85rem;
+  margin-bottom: 0.35rem;
+}
+.auth-field input {
+  width: 100%;
+  padding: 0.6rem 0.8rem;
+  border: 1.5px solid #ccd0d5;
+  border-radius: 6px;
+  font-size: 0.95rem;
+  outline: none;
+}
+.auth-field input:focus { border-color: #0f3460; }
+
+.auth-submit {
+  width: 100%;
+  background: #0f3460;
+  color: #fff;
+  border: none;
+  padding: 0.7rem;
+  border-radius: 6px;
+  font-size: 0.95rem;
+  font-weight: 600;
+  cursor: pointer;
+  margin-top: 0.25rem;
+}
+.auth-submit:hover    { background: #16213e; }
+.auth-submit:disabled { opacity: 0.6; cursor: not-allowed; }
+
+.auth-error {
+  background: #fdecea;
+  color: #a12822;
+  border-left: 3px solid #e74c3c;
+  padding: 0.6rem 0.9rem;
+  border-radius: 0 6px 6px 0;
+  font-size: 0.85rem;
+  margin-bottom: 1rem;
+  display: none;
+}
+.auth-error.visible { display: block; }
+
+.auth-notice {
+  background: #eef2ff;
+  color: #0f3460;
+  border-left: 3px solid #0f3460;
+  padding: 0.6rem 0.9rem;
+  border-radius: 0 6px 6px 0;
+  font-size: 0.85rem;
+  margin-bottom: 1rem;
+  display: none;
+}
+.auth-notice.visible { display: block; }
+
+.auth-switch { margin-top: 1rem; font-size: 0.85rem; text-align: center; color: #555; }
+.auth-switch a { color: #0f3460; text-decoration: none; font-weight: 600; }
+.auth-switch a:hover { text-decoration: underline; }

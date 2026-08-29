@@ -162,7 +162,7 @@ class TestSaveChunks:
     def test_calls_execute_values(self, mock_conn):
         _, _ = mock_conn
         chunks = ["chunk one", "chunk two"]
-        embs = [np.zeros(384), np.ones(384)]
+        embs = [np.zeros(768), np.ones(768)]
         with patch("psycopg2.extras.execute_values") as mock_ev:
             db.save_chunks("pmid-1", chunks, embs)
         mock_ev.assert_called_once()
@@ -170,7 +170,7 @@ class TestSaveChunks:
     def test_data_indexed_correctly(self, mock_conn):
         _, _ = mock_conn
         chunks = ["alpha", "beta"]
-        embs = [np.array([0.1] * 384), np.array([0.2] * 384)]
+        embs = [np.array([0.1] * 768), np.array([0.2] * 768)]
         with patch("psycopg2.extras.execute_values") as mock_ev:
             db.save_chunks("pmid-2", chunks, embs)
         _, data = mock_ev.call_args.args[1], mock_ev.call_args.args[2]
@@ -180,7 +180,7 @@ class TestSaveChunks:
     def test_on_conflict_in_sql(self, mock_conn):
         _, _ = mock_conn
         with patch("psycopg2.extras.execute_values") as mock_ev:
-            db.save_chunks("p", ["c"], [np.zeros(384)])
+            db.save_chunks("p", ["c"], [np.zeros(768)])
         sql = mock_ev.call_args.args[1]
         assert "ON CONFLICT" in sql
         assert "DO NOTHING" in sql
@@ -299,7 +299,7 @@ class TestSemanticSearch:
         conn, cur = _make_conn()
         cur.fetchall.return_value = [row]
         with patch("db._connect", return_value=conn):
-            results = db.semantic_search(1, np.zeros(384), k=1)
+            results = db.semantic_search(1, np.zeros(768), k=1)
         assert isinstance(results[0]["similarity"], float)
         assert results[0]["similarity"] == pytest.approx(0.850)
 
@@ -307,13 +307,13 @@ class TestSemanticSearch:
         conn, cur = _make_conn()
         cur.fetchall.return_value = []
         with patch("db._connect", return_value=conn):
-            results = db.semantic_search(1, np.zeros(384), k=5)
+            results = db.semantic_search(1, np.zeros(768), k=5)
         assert results == []
 
     def test_passes_embedding_and_cid(self):
         conn, cur = _make_conn()
         cur.fetchall.return_value = []
-        emb = np.ones(384)
+        emb = np.ones(768)
         with patch("db._connect", return_value=conn):
             db.semantic_search(7, emb, k=3)
         _, params = cur.execute.call_args.args
@@ -327,7 +327,7 @@ class TestSemanticSearch:
         conn, cur = _make_conn()
         cur.fetchall.return_value = rows
         with patch("db._connect", return_value=conn):
-            results = db.semantic_search(1, np.zeros(384))
+            results = db.semantic_search(1, np.zeros(768))
         for r in results:
             assert isinstance(r["similarity"], float)
 

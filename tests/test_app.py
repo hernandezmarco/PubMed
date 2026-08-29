@@ -29,10 +29,10 @@ import requests
 # Patch heavy imports before importing app so the module loads cleanly in CI.
 import sys
 
-# Stub out fastembed so get_embedder() is never called implicitly at import time
-fastembed_stub = MagicMock()
-fastembed_stub.TextEmbedding = MagicMock()
-sys.modules.setdefault("fastembed", fastembed_stub)
+# Stub out sentence_transformers so get_embedder() is never called implicitly at import time
+st_stub = MagicMock()
+st_stub.SentenceTransformer = MagicMock()
+sys.modules.setdefault("sentence_transformers", st_stub)
 
 import app as _app  # noqa: E402  (must come after stubs)
 import auth
@@ -475,21 +475,21 @@ def _make_ncbi_resp(status_code: int = 200, json_data: dict | None = None,
 class TestEmbedTexts:
     def test_returns_numpy_arrays(self):
         mock_embedder = MagicMock()
-        mock_embedder.embed.return_value = [np.array([0.1, 0.2, 0.3])]
+        mock_embedder.encode.return_value = [np.array([0.1, 0.2, 0.3])]
         with patch("app.get_embedder", return_value=mock_embedder):
             result = _app.embed_texts(["hello"])
         assert isinstance(result[0], np.ndarray)
 
     def test_multiple_texts(self):
         mock_embedder = MagicMock()
-        mock_embedder.embed.return_value = [np.zeros(3), np.ones(3)]
+        mock_embedder.encode.return_value = [np.zeros(3), np.ones(3)]
         with patch("app.get_embedder", return_value=mock_embedder):
             result = _app.embed_texts(["a", "b"])
         assert len(result) == 2
 
     def test_get_embedder_caches_instance(self, monkeypatch):
         monkeypatch.setattr(_app, "_embedder", None)
-        # fastembed is stubbed at the top of this file; TextEmbedding is a MagicMock
+        # sentence_transformers is stubbed at the top of this file; SentenceTransformer is a MagicMock
         e1 = _app.get_embedder()
         e2 = _app.get_embedder()
         assert e1 is e2
@@ -1022,7 +1022,7 @@ class TestCollectionsSaveRoute:
         art1 = {**self._ART, "pmid": "111", "abstract": "Abstract one."}
         art2 = {**self._ART, "pmid": "222", "abstract": "Abstract two."}
         mock_fetch.side_effect = [(art1, None, None), (art2, None, None)]
-        mock_embed.return_value = [np.zeros(384)] * 100  # oversized; index slicing handles it
+        mock_embed.return_value = [np.zeros(768)] * 100  # oversized; index slicing handles it
 
         client.post("/collections", json={
             "name": "Batch Test",
@@ -1069,7 +1069,7 @@ class TestCollectionAskRoute:
     def test_no_chunks_streams_empty_message(
         self, mock_get_collection, mock_embed, mock_create_conv, mock_add_msg, mock_search, client
     ):
-        mock_embed.return_value = [np.zeros(384)]
+        mock_embed.return_value = [np.zeros(768)]
         resp = client.post(
             "/collections/1/ask",
             json={"question": "What is this?"},

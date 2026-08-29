@@ -76,7 +76,13 @@ QUERY_BUILDER_MODEL     = os.getenv("QUERY_BUILDER_MODEL",     "claude-opus-4-6"
 STARTER_QUESTIONS_MODEL = os.getenv("STARTER_QUESTIONS_MODEL", "claude-opus-4-6")
 DEFAULT_CHAT_MODEL      = os.getenv("DEFAULT_CHAT_MODEL",      "claude-opus-4-6")
 
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+# NeuML/pubmedbert-base-embeddings — PubMedBERT fine-tuned for biomedical semantic
+# search, trained specifically on PubMed title/abstract pairs. Only ships
+# PyTorch/safetensors weights (no ONNX), so it's loaded via sentence-transformers
+# rather than fastembed. 768-dim — EMBEDDING_DIM below must match whatever model
+# is configured here, since it's baked into the article_chunks.embedding column type.
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "NeuML/pubmedbert-base-embeddings")
+EMBEDDING_DIM   = int(os.getenv("EMBEDDING_DIM", "768"))
 
 # All chat models available for selection. Entries whose requires_key env var is
 # not set at startup are hidden from the UI. Ollama models are appended at
@@ -150,12 +156,12 @@ MAX_RESULTS_MAX     = 200
 SEMANTIC_SEARCH_K   = 5   # top-k chunks retrieved per RAG query
 
 # ── Embedding ────────────────────────────────────────────────────────────────
-# EMBED_THREADS caps the ONNX Runtime thread pool — the primary lever for
+# EMBED_THREADS caps PyTorch's intra-op CPU thread pool — the primary lever for
 # preventing CPU spikes in memory-constrained containers. Set to 1 to keep
 # CPU usage flat; raise to 2-4 if the host has spare cores.
-# EMBED_BATCH_SIZE controls texts per ONNX forward pass (default upstream: 256).
-# Lowering it reduces peak memory and smooths CPU load at the cost of
-# slightly longer total embedding time.
+# EMBED_BATCH_SIZE controls texts per encode() forward pass. Lowering it reduces
+# peak memory and smooths CPU load at the cost of slightly longer total
+# embedding time.
 
 EMBED_THREADS    = int(os.environ.get("EMBED_THREADS",    "1"))
 EMBED_BATCH_SIZE = int(os.environ.get("EMBED_BATCH_SIZE", "32"))

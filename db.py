@@ -25,6 +25,8 @@ import psycopg2
 import psycopg2.extras
 from pgvector.psycopg2 import register_vector
 
+import config as cfg
+
 _log = logging.getLogger("pubmed.db")
 
 
@@ -67,8 +69,9 @@ def init_db():
                 created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
-        # Migrate existing tables that pre-date this column
+        # Migrate existing tables that pre-date these columns
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE")
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ")
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS refresh_tokens (
@@ -152,14 +155,17 @@ def init_db():
         cur.execute("ALTER TABLE rag_articles ADD COLUMN IF NOT EXISTS has_full_text BOOLEAN DEFAULT FALSE")
         cur.execute("ALTER TABLE rag_articles ADD COLUMN IF NOT EXISTS pmcid TEXT")
 
-        # Shared chunk store — deduped by (pmid, chunk_index)
-        cur.execute("""
+        # Shared chunk store — deduped by (pmid, chunk_index). Only takes effect on a
+        # fresh install; if article_chunks already exists with a different embedding
+        # dimension (e.g. after switching EMBEDDING_MODEL), run
+        # scripts/migrate_embedding_dim.py to resize the column and re-embed in place.
+        cur.execute(f"""
             CREATE TABLE IF NOT EXISTS article_chunks (
                 id          SERIAL PRIMARY KEY,
                 pmid        TEXT NOT NULL,
                 chunk_index INTEGER NOT NULL,
                 text        TEXT NOT NULL,
-                embedding   vector(384),
+                embedding   vector({cfg.EMBEDDING_DIM}),
                 UNIQUE(pmid, chunk_index)
             )
         """)
@@ -212,7 +218,7 @@ def get_user_by_email(email: str) -> dict | None:
     with db_conn() as conn:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute(
-            "SELECT id, email, password_hash, is_active, email_verified FROM users WHERE email = %s",
+            "SELECT id, email, password_hash, is_active, email_verified, last_login FROM users WHERE email = %s",
             (email,),
         )
         row = cur.fetchone()
@@ -226,7 +232,7 @@ def get_user_by_id(user_id: int) -> dict | None:
     with db_conn() as conn:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute(
-            "SELECT id, email, password_hash, is_active, email_verified FROM users WHERE id = %s",
+            "SELECT id, email, password_hash, is_active, email_verified, last_login FROM users WHERE id = %s",
             (user_id,),
         )
         row = cur.fetchone()
@@ -251,6 +257,15 @@ def mark_user_verified(user_id: int) -> None:
             "UPDATE users SET email_verified = TRUE WHERE id = %s", (user_id,)
         )
     _log.info("op=mark_user_verified user_id=%d duration=%.3fs", user_id, time.perf_counter() - t0)
+
+
+def update_last_login(user_id: int) -> None:
+    t0 = time.perf_counter()
+    with db_conn() as conn:
+        conn.cursor().execute(
+            "UPDATE users SET last_login = NOW() WHERE id = %s", (user_id,)
+        )
+    _log.debug("op=update_last_login user_id=%d duration=%.3fs", user_id, time.perf_counter() - t0)
 
 
 def assign_orphaned_collections(user_id: int) -> int:

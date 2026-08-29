@@ -172,8 +172,10 @@ _embedder = None
 def get_embedder():
     global _embedder
     if _embedder is None:
-        from fastembed import TextEmbedding
-        _embedder = TextEmbedding(cfg.EMBEDDING_MODEL, threads=cfg.EMBED_THREADS)
+        import torch
+        from sentence_transformers import SentenceTransformer
+        torch.set_num_threads(cfg.EMBED_THREADS)
+        _embedder = SentenceTransformer(cfg.EMBEDDING_MODEL, device="cpu")
         _embed_log.info("Embedder loaded model=%s threads=%d", cfg.EMBEDDING_MODEL, cfg.EMBED_THREADS)
     return _embedder
 
@@ -181,7 +183,8 @@ def get_embedder():
 def embed_texts(texts: list[str]) -> list[np.ndarray]:
     _embed_log.debug("Embedding %d text(s)", len(texts))
     t0 = time.perf_counter()
-    result = [np.array(v, dtype=np.float32) for v in get_embedder().embed(texts, batch_size=cfg.EMBED_BATCH_SIZE)]
+    vectors = get_embedder().encode(texts, batch_size=cfg.EMBED_BATCH_SIZE)
+    result = [np.array(v, dtype=np.float32) for v in vectors]
     elapsed = time.perf_counter() - t0
     dim = len(result[0]) if result else 0
     _embed_log.info("Embedded texts=%d dim=%d duration=%.3fs", len(texts), dim, elapsed)
@@ -596,6 +599,7 @@ def auth_login():
             "code": "email_not_verified",
         }), 403
 
+    db.update_last_login(user["id"])
     return _issue_auth_cookies(user["id"])
 
 

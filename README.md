@@ -140,7 +140,7 @@ python app.py
 
 Open [http://127.0.0.1:8080](http://127.0.0.1:8080). Every page requires an account — register one at `/register` and click the verification link emailed to you before you can log in, or run `python -m scripts.bootstrap_admin` to create/promote a specific account (auto-verified, skips the email step; it also reassigns any pre-auth collections, `user_id IS NULL`, to that account).
 
-The first search will download the `BAAI/bge-small-en-v1.5` embedding model (~130 MB) into `~/.cache/fastembed`. Subsequent starts are instant.
+The first search will download the `NeuML/pubmedbert-base-embeddings` embedding model into `~/.cache/huggingface`. Subsequent starts are instant.
 
 ---
 
@@ -266,7 +266,7 @@ Database (PostgreSQL + pgvector)
   ├── rag_collections        — id, name, user_query, pubmed_query, created_at
   ├── rag_articles           — id, collection_id, pmid, title, authors, journal, year,
   │                            abstract, url, has_full_text, pmcid
-  ├── article_chunks         — id, pmid, chunk_index, text, embedding vector(384)
+  ├── article_chunks         — id, pmid, chunk_index, text, embedding vector(768)
   │                            UNIQUE(pmid, chunk_index) · HNSW index on embedding
   ├── conversations          — id, collection_id, title (first question), created_at
   └── conversation_messages  — id, conversation_id, role (user|assistant), content,

@@ -24,8 +24,8 @@
 #    because the container has its own isolated network namespace.
 #  - Serving — gunicorn (wsgi:application), not the Flask dev server. `python app.py` (Werkzeug's dev server, with its
 #    interactive debugger) is for local development only — see CLAUDE.md.
-#  - libgomp1 — the only system dep needed; onnxruntime (fastembed's backend) requires it at runtime on Debian slim images
-#  - Model pre-baked — BAAI/bge-small-en-v1.5 is downloaded during docker build so the container starts immediately without a model download delay
+#  - libgomp1 — the only system dep needed; PyTorch (sentence-transformers' backend) requires it at runtime on Debian slim images
+#  - Model pre-baked — NeuML/pubmedbert-base-embeddings is downloaded during docker build so the container starts immediately without a model download delay
 #  - -v $(pwd)/logs:/app/logs — mounts the log directory as a volume so logs survive container restarts
 #  - DB_HOST=host.docker.internal — use this when your Postgres is running on the host machine; replace with the actual hostname/IP if Postgres is elsewhere
 #  - OPENAI_API_KEY / OLLAMA_BASE_URL / OLLAMA_API_KEY — all optional; omit any to leave that provider out of the
@@ -41,7 +41,7 @@ FROM python:3.12-slim
 WORKDIR /app
 
 # ── System dependencies ───────────────────────────────────────────────────────
-# libgomp is required by onnxruntime (used by fastembed)
+# libgomp is required by PyTorch (used by sentence-transformers)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*
@@ -51,8 +51,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # ── Pre-download embedding model ──────────────────────────────────────────────
-# Bakes BAAI/bge-small-en-v1.5 into the image so startup is instant
-RUN python -c "from fastembed import TextEmbedding; TextEmbedding('BAAI/bge-small-en-v1.5')" \
+# Bakes NeuML/pubmedbert-base-embeddings into the image so startup is instant
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('NeuML/pubmedbert-base-embeddings')" \
     && mkdir -p logs
 
 # ── Application code ──────────────────────────────────────────────────────────

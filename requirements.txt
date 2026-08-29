@@ -8,6 +8,6 @@ requests
 python-dotenv
 psycopg2-binary
 pgvector
-fastembed
+sentence-transformers
 python-docx
 pytest-cov

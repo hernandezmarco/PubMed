@@ -24,8 +24,12 @@ import os
 
 # ── Provider credentials ──────────────────────────────────────────────────────
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY",    "")
+# Env var names, also referenced by CHAT_MODELS' "requires_key" entries below.
+_ANTHROPIC_API_KEY_ENV = "ANTHROPIC_API_KEY"
+_OPENAI_API_KEY_ENV    = "OPENAI_API_KEY"
+
+ANTHROPIC_API_KEY = os.getenv(_ANTHROPIC_API_KEY_ENV, "")
+OPENAI_API_KEY    = os.getenv(_OPENAI_API_KEY_ENV,    "")
 OLLAMA_BASE_URL   = os.getenv("OLLAMA_BASE_URL",   "http://localhost:11434")
 OLLAMA_API_KEY    = os.getenv("OLLAMA_API_KEY",    "")
 
@@ -51,10 +55,10 @@ FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY", "")
 # flask-limiter uses in-memory (per-worker) storage — see README for the tradeoff.
 LOGIN_RATE_LIMIT                = os.getenv("LOGIN_RATE_LIMIT",                "5 per minute")
 REGISTER_RATE_LIMIT             = os.getenv("REGISTER_RATE_LIMIT",             "5 per hour")
-FORGOT_PASSWORD_RATE_LIMIT      = os.getenv("FORGOT_PASSWORD_RATE_LIMIT",      "3 per hour")
+FORGOT_PASSWORD_RATE_LIMIT      = os.getenv("FORGOT_PASSWORD_RATE_LIMIT",      "3 per hour")  # NOSONAR
 RESEND_VERIFICATION_RATE_LIMIT  = os.getenv("RESEND_VERIFICATION_RATE_LIMIT",  "3 per hour")
 
-PASSWORD_RESET_TTL_MINUTES      = int(os.getenv("PASSWORD_RESET_TTL_MINUTES",      "60"))
+PASSWORD_RESET_TTL_MINUTES      = int(os.getenv("PASSWORD_RESET_TTL_MINUTES",      "60"))  # NOSONAR
 EMAIL_VERIFICATION_TTL_MINUTES  = int(os.getenv("EMAIL_VERIFICATION_TTL_MINUTES",  "1440"))
 
 # ── Email (SMTP2GO HTTP API — https://api.smtp2go.com/v3/email/send) ──────────
@@ -72,9 +76,12 @@ APP_BASE_URL = os.getenv("APP_BASE_URL", "https://localhost:8080")
 
 # ── Models ────────────────────────────────────────────────────────────────────
 
-QUERY_BUILDER_MODEL     = os.getenv("QUERY_BUILDER_MODEL",     "claude-opus-4-6")
-STARTER_QUESTIONS_MODEL = os.getenv("STARTER_QUESTIONS_MODEL", "claude-opus-4-6")
-DEFAULT_CHAT_MODEL      = os.getenv("DEFAULT_CHAT_MODEL",      "claude-opus-4-6")
+# Also used as the CHAT_MODELS key for this model below.
+_DEFAULT_MODEL_ID = "claude-opus-4-6"
+
+QUERY_BUILDER_MODEL     = os.getenv("QUERY_BUILDER_MODEL",     _DEFAULT_MODEL_ID)
+STARTER_QUESTIONS_MODEL = os.getenv("STARTER_QUESTIONS_MODEL", _DEFAULT_MODEL_ID)
+DEFAULT_CHAT_MODEL      = os.getenv("DEFAULT_CHAT_MODEL",      _DEFAULT_MODEL_ID)
 
 # NeuML/pubmedbert-base-embeddings — PubMedBERT fine-tuned for biomedical semantic
 # search, trained specifically on PubMed title/abstract pairs. Only ships
@@ -88,38 +95,38 @@ EMBEDDING_DIM   = int(os.getenv("EMBEDDING_DIM", "768"))
 # not set at startup are hidden from the UI. Ollama models are appended at
 # runtime via dynamic discovery (see app.py:available_chat_models).
 CHAT_MODELS: dict[str, dict] = {
-    "claude-opus-4-6": {
+    _DEFAULT_MODEL_ID: {
         "display":      "Opus 4.6",
         "provider":     "anthropic",
-        "requires_key": "ANTHROPIC_API_KEY",
+        "requires_key": _ANTHROPIC_API_KEY_ENV,
         "input_price":  15.00,
         "output_price": 75.00,
     },
     "claude-sonnet-4-6": {
         "display":      "Sonnet 4.6",
         "provider":     "anthropic",
-        "requires_key": "ANTHROPIC_API_KEY",
+        "requires_key": _ANTHROPIC_API_KEY_ENV,
         "input_price":   3.00,
         "output_price": 15.00,
     },
     "claude-haiku-4-5-20251001": {
         "display":      "Haiku 4.5",
         "provider":     "anthropic",
-        "requires_key": "ANTHROPIC_API_KEY",
+        "requires_key": _ANTHROPIC_API_KEY_ENV,
         "input_price":   0.80,
         "output_price":  4.00,
     },
     "gpt-4o": {
         "display":      "GPT-4o",
         "provider":     "openai",
-        "requires_key": "OPENAI_API_KEY",
+        "requires_key": _OPENAI_API_KEY_ENV,
         "input_price":   2.50,
         "output_price": 10.00,
     },
     "o3": {
         "display":      "o3",
         "provider":     "openai",
-        "requires_key": "OPENAI_API_KEY",
+        "requires_key": _OPENAI_API_KEY_ENV,
         "input_price":  10.00,
         "output_price": 40.00,
     },

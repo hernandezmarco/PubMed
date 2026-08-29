@@ -47,9 +47,9 @@ def mock_conn():
 
 # ── db_conn context manager ───────────────────────────────────────────────────
 
-def _raise_inside_db_conn(exc: Exception):
+def _raise_inside_db_conn(exc_type: type[Exception], message: str):
     with db.db_conn():
-        raise exc
+        raise exc_type(message)
 
 
 class TestDbConn:
@@ -65,7 +65,7 @@ class TestDbConn:
         conn, _ = _make_conn()
         with patch("db._connect", return_value=conn):
             with pytest.raises(ValueError):
-                _raise_inside_db_conn(ValueError("boom"))
+                _raise_inside_db_conn(ValueError, "boom")
         conn.rollback.assert_called_once()
         conn.commit.assert_not_called()
 
@@ -73,7 +73,7 @@ class TestDbConn:
         conn, _ = _make_conn()
         with patch("db._connect", return_value=conn):
             with pytest.raises(RuntimeError):
-                _raise_inside_db_conn(RuntimeError("err"))
+                _raise_inside_db_conn(RuntimeError, "err")
         conn.close.assert_called_once()
 
     def test_connection_closed_on_success_too(self):

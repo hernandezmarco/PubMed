@@ -739,55 +739,6 @@ def collections():
     return render_template("collections.html", collections=items)
 
 
-@app.route("/collections", methods=["POST"])
-@auth.login_required
-def collections_save():
-    """Receive selected articles, fetch PMC full text where available, chunk, embed, store."""
-    payload = request.get_json(force=True)
-    name = (payload.get("name") or "").strip()
-    user_query = payload.get("user_query", "")
-    pubmed_query = payload.get("pubmed_query", "")
-    articles = payload.get("articles", [])
-
-    if not name:
-        return {"error": "Collection name is required."}, 400
-    if not articles:
-        return {"error": "No articles to save."}, 400
-
-    try:
-        pmids = [a["pmid"] for a in articles]
-        pmcid_map = get_pmcids(pmids)
-        cid = db.create_collection(name, user_query, pubmed_query, g.user_id)
-
-        # Phase 1: fetch PMC full texts in parallel (I/O-bound network calls)
-        max_workers = min(len(articles), 8)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            fetched = list(executor.map(_fetch_article_text, articles, [pmcid_map] * len(articles)))
-
-        # Phase 2: persist article rows; collect chunks that still need embedding
-        pending: list[tuple[str, list[str]]] = []  # [(pmid, chunks), ...]
-        for art, full_text, pmcid in fetched:
-            db.add_article(cid, art, has_full_text=bool(full_text), pmcid=pmcid)
-            pmid = art["pmid"]
-            if not db.chunks_exist(pmid):
-                text_to_chunk = full_text or f"{art['title']}. {art['abstract']}"
-                pending.append((pmid, chunk_text(text_to_chunk, cfg.CHUNK_SIZE, cfg.CHUNK_OVERLAP)))
-
-        # Phase 3: embed all pending chunks in one batch, then save
-        if pending:
-            all_chunks = [c for _, chunks in pending for c in chunks]
-            all_embeddings = embed_texts(all_chunks)
-            offset = 0
-            for pmid, chunks in pending:
-                n = len(chunks)
-                db.save_chunks(pmid, chunks, all_embeddings[offset:offset + n])
-                offset += n
-
-        return {"id": cid}
-    except Exception as exc:
-        return {"error": str(exc)}, 500
-
-
 def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
@@ -829,20 +780,32 @@ def _save_persist_phase(cid: int, fetched: list) -> list[tuple[str, list[str], b
 
 
 def _save_embed_phase(pending: list[tuple[str, list[str], bool]]):
-    """Generator — yields SSE embedding event then embeds and saves all pending chunks."""
+    """Generator — yields SSE embedding progress events while embedding pending chunks in
+    batches, then saves them. Embedding in one un-chunked call for a large collection can run
+    long enough to trip gunicorn's worker timeout (it can't heartbeat mid-call); batching keeps
+    control returning to the SSE stream regularly."""
     if not pending:
         return
     full_text_count = sum(1 for _, _, is_full_text in pending if is_full_text)
+    flat_chunks = [(pmid, chunk) for pmid, chunks, _ in pending for chunk in chunks]
+    total_chunks = len(flat_chunks)
     yield _sse({"type": "embedding", "count": len(pending),
                 "full_text": full_text_count,
-                "abstract": len(pending) - full_text_count})
-    all_chunks = [c for _, chunks, _ in pending for c in chunks]
-    all_embeddings = embed_texts(all_chunks)
-    offset = 0
+                "abstract": len(pending) - full_text_count,
+                "total_chunks": total_chunks})
+
+    embeddings_by_pmid: dict[str, list[np.ndarray]] = {pmid: [] for pmid, _, _ in pending}
+    done = 0
+    for start in range(0, total_chunks, cfg.EMBED_BATCH_SIZE):
+        batch = flat_chunks[start:start + cfg.EMBED_BATCH_SIZE]
+        vectors = embed_texts([text for _, text in batch])
+        for (pmid, _), vector in zip(batch, vectors):
+            embeddings_by_pmid[pmid].append(vector)
+        done += len(batch)
+        yield _sse({"type": "embedding_progress", "done": done, "total": total_chunks})
+
     for pmid, chunks, _ in pending:
-        n = len(chunks)
-        db.save_chunks(pmid, chunks, all_embeddings[offset:offset + n])
-        offset += n
+        db.save_chunks(pmid, chunks, embeddings_by_pmid[pmid])
 
 
 @app.route("/collections/save-stream", methods=["POST"])

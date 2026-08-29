@@ -587,6 +587,43 @@ class TestSearchPubmed:
             result = _app.search_pubmed("obscure[MeSH]", 25)
         assert result == []
 
+    def test_no_date_params_when_omitted(self):
+        resp = _make_ncbi_resp(200, json_data={"esearchresult": {"idlist": []}})
+        with patch("app._ncbi_post", return_value=resp) as mock_post:
+            _app.search_pubmed("diabetes[MeSH]", 25)
+        params = mock_post.call_args.kwargs["params"]
+        assert "mindate" not in params and "maxdate" not in params and "datetype" not in params
+
+    def test_date_params_included_when_both_given(self):
+        resp = _make_ncbi_resp(200, json_data={"esearchresult": {"idlist": []}})
+        with patch("app._ncbi_post", return_value=resp) as mock_post:
+            _app.search_pubmed("diabetes[MeSH]", 25, mindate="2020/01/01", maxdate="2024/12/31")
+        params = mock_post.call_args.kwargs["params"]
+        assert params["datetype"] == "pdat"
+        assert params["mindate"] == "2020/01/01"
+        assert params["maxdate"] == "2024/12/31"
+
+
+# ── _normalize_date_range ────────────────────────────────────────────────────
+
+class TestNormalizeDateRange:
+    def test_both_empty_returns_none(self):
+        assert _app._normalize_date_range("", "") is None
+
+    def test_both_given_converts_slashes(self):
+        result = _app._normalize_date_range("2020-01-15", "2024-06-30")
+        assert result == ("2020/01/15", "2024/06/30")
+
+    def test_only_start_given_defaults_end_to_today(self):
+        with patch("app.datetime.date") as mock_date:
+            mock_date.today.return_value.strftime.return_value = "2026/08/29"
+            result = _app._normalize_date_range("2020-01-15", "")
+        assert result == ("2020/01/15", "2026/08/29")
+
+    def test_only_end_given_defaults_start_to_earliest(self):
+        result = _app._normalize_date_range("", "2024-06-30")
+        assert result == (_app._PUBMED_EARLIEST_DATE, "2024/06/30")
+
 
 # ── _parse_article ────────────────────────────────────────────────────────────
 
@@ -929,7 +966,7 @@ class TestIndexRoute:
         mock_run.return_value = ([], "diabetes[MeSH]", None)
         resp = client.post("/", data={"query": "diabetes research", "max_results": "25"})
         assert resp.status_code == 200
-        mock_run.assert_called_once_with("diabetes research", 25)
+        mock_run.assert_called_once_with("diabetes research", 25, mindate=None, maxdate=None)
 
     def test_post_empty_query_no_search(self, client):
         resp = client.post("/", data={"query": ""})
@@ -942,6 +979,27 @@ class TestIndexRoute:
         assert resp.status_code == 200
         assert b"API key invalid" in resp.data
 
+    @patch("app._run_search")
+    def test_date_range_passed_through(self, mock_run, client):
+        mock_run.return_value = ([], "diabetes[MeSH]", None)
+        client.post("/", data={
+            "query": "diabetes research", "max_results": "25",
+            "start_date": "2020-01-01", "end_date": "2024-12-31",
+        })
+        mock_run.assert_called_once_with(
+            "diabetes research", 25, mindate="2020/01/01", maxdate="2024/12/31"
+        )
+
+    def test_start_after_end_returns_error_without_searching(self, client):
+        with patch("app._run_search") as mock_run:
+            resp = client.post("/", data={
+                "query": "diabetes research",
+                "start_date": "2024-12-31", "end_date": "2020-01-01",
+            })
+        assert resp.status_code == 200
+        assert b"Start date must be on or before the end date." in resp.data
+        mock_run.assert_not_called()
+
 
 class TestCollectionsRoute:
     @patch("app.db.list_collections", return_value=[])
@@ -949,6 +1007,18 @@ class TestCollectionsRoute:
         resp = client.get("/collections")
         assert resp.status_code == 200
         mock_list.assert_called_once()
+
+    @patch("app.db.list_collections")
+    def test_shows_full_text_and_abstract_only_counts(self, mock_list, client):
+        mock_list.return_value = [{
+            "id": 1, "name": "Diabetes", "user_query": "q", "pubmed_query": "q[MeSH]",
+            "created_at": "2026-01-01T00:00:00",
+            "article_count": 10, "full_text_count": 6, "chunk_count": 42,
+        }]
+        resp = client.get("/collections")
+        html = resp.get_data(as_text=True)
+        assert "6 full text" in html
+        assert "4 abstract only" in html
 
 
 class TestFetchArticleText:

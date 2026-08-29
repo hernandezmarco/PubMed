@@ -219,8 +219,16 @@ function setStep(index) {
   });
 }
 
-form.addEventListener('submit', function () {
+form.addEventListener('submit', function (e) {
   if (!document.getElementById('query').value.trim()) return;
+
+  const startDate = document.getElementById('start-date').value;
+  const endDate = document.getElementById('end-date').value;
+  if (startDate && endDate && startDate > endDate) {
+    e.preventDefault();
+    alert('Start date must be on or before the end date.');
+    return;
+  }
 
   btn.disabled = true;
   btn.textContent = 'Searching…';

@@ -31,6 +31,7 @@
         <div class="card-meta">
           <span class="badge">{{ col.article_count }} articles</span>
           <span class="badge">{{ col.full_text_count }} full text</span>
+          <span class="badge">{{ col.article_count - col.full_text_count }} abstract only</span>
           <span class="badge">{{ col.chunk_count }} chunks</span>
           {{ col.created_at[:10] }}
         </div>

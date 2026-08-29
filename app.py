@@ -21,6 +21,7 @@ import logging.handlers
 import os
 import re
 import secrets
+import threading
 import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -167,16 +168,21 @@ def available_chat_models() -> dict[str, dict]:
 # ── Embeddings ────────────────────────────────────────────────────────────────
 
 _embedder = None
+_embedder_lock = threading.Lock()
 
 
 def get_embedder():
     global _embedder
     if _embedder is None:
-        import torch
-        from sentence_transformers import SentenceTransformer
-        torch.set_num_threads(cfg.EMBED_THREADS)
-        _embedder = SentenceTransformer(cfg.EMBEDDING_MODEL, device="cpu")
-        _embed_log.info("Embedder loaded model=%s threads=%d", cfg.EMBEDDING_MODEL, cfg.EMBED_THREADS)
+        # gthread workers can run multiple requests concurrently in the same process,
+        # so first-use lazy init needs a lock to avoid double-loading the model.
+        with _embedder_lock:
+            if _embedder is None:
+                import torch
+                from sentence_transformers import SentenceTransformer
+                torch.set_num_threads(cfg.EMBED_THREADS)
+                _embedder = SentenceTransformer(cfg.EMBEDDING_MODEL, device="cpu")
+                _embed_log.info("Embedder loaded model=%s threads=%d", cfg.EMBEDDING_MODEL, cfg.EMBED_THREADS)
     return _embedder
 
 
@@ -294,12 +300,16 @@ def _ncbi_post(url: str, params: dict, timeout: int, max_retries: int = 4) -> re
             delay = min(delay * 2, cfg.NCBI_BACKOFF_MAX)
 
 
-def search_pubmed(query: str, max_results: int = 25) -> list[str]:
-    _api_log.debug("op=esearch query=%r max=%d", query[:120], max_results)
+def search_pubmed(query: str, max_results: int = 25, mindate: str | None = None, maxdate: str | None = None) -> list[str]:
+    _api_log.debug("op=esearch query=%r max=%d mindate=%s maxdate=%s", query[:120], max_results, mindate, maxdate)
     t0 = time.perf_counter()
+    params = {"db": "pubmed", "term": query, "retmax": max_results, "retmode": "json", "sort": "relevance"}
+    if mindate and maxdate:
+        # datetype=pdat filters by publication date; mindate/maxdate must be given together.
+        params.update({"datetype": "pdat", "mindate": mindate, "maxdate": maxdate})
     resp = _ncbi_post(
         f"{cfg.PUBMED_BASE}/esearch.fcgi",
-        params={"db": "pubmed", "term": query, "retmax": max_results, "retmode": "json", "sort": "relevance"},
+        params=params,
         timeout=cfg.TIMEOUT_ESEARCH,
     )
     resp.raise_for_status()
@@ -470,6 +480,22 @@ def _clamp_max_results(raw: str) -> int:
     return max(cfg.MAX_RESULTS_MIN, min(cfg.MAX_RESULTS_MAX, (value // cfg.MAX_RESULTS_MIN) * cfg.MAX_RESULTS_MIN))
 
 
+# PubMed's indexing effectively starts here — used as the open lower bound when only an
+# end date is picked.
+_PUBMED_EARLIEST_DATE = "1800/01/01"
+
+
+def _normalize_date_range(start_date: str, end_date: str) -> tuple[str, str] | None:
+    """Convert HTML date-input values (YYYY-MM-DD) to PubMed's mindate/maxdate format
+    (YYYY/MM/DD). Returns None if neither bound was given; fills in an open bound
+    (earliest possible / today) when only one side was picked."""
+    if not start_date and not end_date:
+        return None
+    mindate = start_date.replace("-", "/") if start_date else _PUBMED_EARLIEST_DATE
+    maxdate = end_date.replace("-", "/") if end_date else datetime.date.today().strftime("%Y/%m/%d")
+    return mindate, maxdate
+
+
 def _attach_similarities(user_query: str, results: list[dict]):
     query_emb = embed_texts([user_query])[0]
     article_texts = [f"{a['title']}. {a['abstract']}" for a in results]
@@ -478,11 +504,13 @@ def _attach_similarities(user_query: str, results: list[dict]):
         art["similarity"] = round(cosine_similarity(query_emb, emb), 3)
 
 
-def _run_search(user_query: str, max_results: int) -> tuple[list[dict] | None, str | None, str | None]:
+def _run_search(
+    user_query: str, max_results: int, mindate: str | None = None, maxdate: str | None = None
+) -> tuple[list[dict] | None, str | None, str | None]:
     """Return (results, pubmed_query, error)."""
     try:
         pubmed_query = build_pubmed_query(user_query)
-        pmids = search_pubmed(pubmed_query, max_results)
+        pmids = search_pubmed(pubmed_query, max_results, mindate, maxdate)
         results = fetch_articles(pmids)
         if results:
             _attach_similarities(user_query, results)
@@ -715,12 +743,21 @@ def index():
     error = None
     user_query = ""
     max_results = cfg.MAX_RESULTS_DEFAULT
+    start_date = ""
+    end_date = ""
 
     if request.method == "POST":
         user_query = request.form.get("query", "").strip()
+        start_date = request.form.get("start_date", "").strip()
+        end_date = request.form.get("end_date", "").strip()
         if user_query:
             max_results = _clamp_max_results(request.form.get("max_results", str(cfg.MAX_RESULTS_DEFAULT)))
-            results, pubmed_query, error = _run_search(user_query, max_results)
+            if start_date and end_date and start_date > end_date:
+                error = "Start date must be on or before the end date."
+            else:
+                date_range = _normalize_date_range(start_date, end_date)
+                mindate, maxdate = date_range if date_range else (None, None)
+                results, pubmed_query, error = _run_search(user_query, max_results, mindate=mindate, maxdate=maxdate)
 
     return render_template(
         "index.html",
@@ -729,6 +766,8 @@ def index():
         results=results,
         error=error,
         max_results=max_results,
+        start_date=start_date,
+        end_date=end_date,
     )
 
 

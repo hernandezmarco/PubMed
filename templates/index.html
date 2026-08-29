@@ -49,6 +49,14 @@
         </select>
         <button class="btn-search" type="submit">Search</button>
       </div>
+      <div class="date-row">
+        <label for="start-date">Publication date</label>
+        <input id="start-date" name="start_date" type="date" value="{{ start_date }}">
+        <span class="date-sep">to</span>
+        <label class="visually-hidden" for="end-date">End date</label>
+        <input id="end-date" name="end_date" type="date" value="{{ end_date }}">
+        <span class="date-hint">Optional — leave blank to search all dates</span>
+      </div>
     </form>
 
     {% if pubmed_query %}

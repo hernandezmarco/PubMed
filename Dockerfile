@@ -61,14 +61,19 @@ COPY . .
 
 EXPOSE 8080
 
-# --timeout 300 — gunicorn's default (30s) kills+respawns a worker (SIGKILL, logged as
-# "WORKER TIMEOUT" / "Perhaps out of memory?" — that message is boilerplate, not a real
-# OOM diagnosis) if it goes quiet mid-request. Saving a large collection (up to
-# MAX_RESULTS_MAX=200 articles: PMC full-text fetches + chunk embedding, all synchronous
-# in one request) routinely exceeds 30s.
+# --worker-class gthread --threads 4 — gunicorn's default "sync" worker only sends its
+# liveness heartbeat to the arbiter between accepted connections, never while a request is
+# being handled — so a single long request (large-collection save: PMC full-text fetches +
+# chunk embedding, all in one streamed request) trips the arbiter's watchdog no matter how
+# that request is internally structured. gthread's heartbeat runs on the worker's own event
+# loop independently of the request threads, so a slow request no longer looks "hung" to the
+# arbiter. get_embedder() (app.py) is lock-guarded for this — gthread lets requests run
+# concurrently within a worker process, where the old sync worker never could.
+# --timeout 1800 — backstop for a request that's genuinely wedged (not just slow), e.g. a
+# hung network call; still well above worst-case save time for MAX_RESULTS_MAX=200 articles.
 # --certfile/--keyfile — terminate TLS in gunicorn itself, using certs/{cert.pem,key.pem}
 # baked into the image by COPY . . above (generate them per CLAUDE.md BEFORE running
 # docker build, or the worker fails to boot with a missing-file error). Required:
 # COOKIE_SECURE defaults to true (auth cookies marked Secure), which browsers silently
 # refuse to store/send over a plain-HTTP connection.
-CMD ["gunicorn", "-b", "0.0.0.0:8080", "-w", "4", "--timeout", "300", "--certfile", "/app/certs/cert.pem", "--keyfile", "/app/certs/key.pem", "wsgi:application"]
+CMD ["gunicorn", "-b", "0.0.0.0:8080", "-w", "4", "--worker-class", "gthread", "--threads", "4", "--timeout", "1800", "--certfile", "/app/certs/cert.pem", "--keyfile", "/app/certs/key.pem", "wsgi:application"]

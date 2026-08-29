@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+
+{% block title %}Log in — PubMed AI{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{{ url_for('static', filename='auth.css') }}?v={{ static_version }}">
+{% endblock %}
+
+{% block header %}
+<h1>PubMed AI Search</h1>
+<p>Log in to continue</p>
+{% endblock %}
+
+{% block content %}
+<div class="container">
+  <div class="auth-card">
+    <h1>Log in</h1>
+    <div class="auth-error" id="auth-error"></div>
+    <div class="auth-notice" id="auth-notice"></div>
+    <p class="auth-switch" id="resend-verification" style="display:none">
+      <a href="#" id="resend-verification-link">Resend verification email</a>
+    </p>
+    <form id="login-form">
+      <div class="auth-field">
+        <label for="email">Email</label>
+        <input id="email" type="email" autocomplete="email" required>
+      </div>
+      <div class="auth-field">
+        <label for="password">Password</label>
+        <input id="password" type="password" autocomplete="current-password" required>
+      </div>
+      <button class="auth-submit" type="submit">Log in</button>
+    </form>
+    <p class="auth-switch"><a href="/forgot-password">Forgot password?</a></p>
+    <p class="auth-switch">Don't have an account? <a href="/register">Register</a></p>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="{{ url_for('static', filename='auth.js') }}?v={{ static_version }}"></script>
+{% endblock %}

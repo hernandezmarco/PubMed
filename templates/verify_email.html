@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+
+{% block title %}Verify email — PubMed AI{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{{ url_for('static', filename='auth.css') }}?v={{ static_version }}">
+{% endblock %}
+
+{% block header %}
+<h1>PubMed AI Search</h1>
+<p>Email verification</p>
+{% endblock %}
+
+{% block content %}
+<div class="container">
+  <div class="auth-card">
+    {% if success %}
+    <h1>Email verified</h1>
+    <p class="auth-notice visible">Your account is verified — you can log in now.</p>
+    <p class="auth-switch"><a href="/login">Continue to log in</a></p>
+    {% else %}
+    <h1>Link invalid or expired</h1>
+    <p class="auth-error visible">
+      This verification link is invalid or has expired. Request a new one below.
+    </p>
+    <div class="auth-notice" id="auth-notice"></div>
+    <form id="resend-verification-form">
+      <div class="auth-field">
+        <label for="email">Email</label>
+        <input id="email" type="email" autocomplete="email" required>
+      </div>
+      <button class="auth-submit" type="submit">Resend verification email</button>
+    </form>
+    <p class="auth-switch"><a href="/login">Back to log in</a></p>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="{{ url_for('static', filename='auth.js') }}?v={{ static_version }}"></script>
+{% endblock %}

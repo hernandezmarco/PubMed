@@ -107,10 +107,18 @@ function _onFetchEvent(evt) {
 
 function _onEmbeddingEvent(evt) {
   Progress.set(78, 200);
-  embedProgressBar.style.width = '88%';
+  embedProgressBar.style.width = '80%';
   embedProgressText.textContent =
     `Embedding ${evt.count} articles (${evt.full_text} full text · ${evt.abstract} abstract)…`;
   btnSave.textContent = 'Embedding…';
+}
+
+function _onEmbeddingProgressEvent(evt) {
+  const pct = Math.round((evt.done / evt.total) * 15) + 80;
+  Progress.set(Math.min(pct, 95), 150);
+  embedProgressBar.style.width = `${Math.min(pct, 95)}%`;
+  embedProgressText.textContent = `Embedding chunks ${evt.done} / ${evt.total}…`;
+  btnSave.textContent = `Embedding… ${evt.done} / ${evt.total}`;
 }
 
 function _onDoneEvent(evt) {
@@ -147,10 +155,11 @@ async function* _readSaveLines(res) {
 async function _dispatchSaveEvents(res) {
   for await (const line of _readSaveLines(res)) {
     const evt = JSON.parse(line.slice(6));
-    if (evt.type === 'fetch')     { _onFetchEvent(evt); continue; }
-    if (evt.type === 'embedding') { _onEmbeddingEvent(evt); continue; }
-    if (evt.type === 'done')      { _onDoneEvent(evt); continue; }
-    if (evt.type === 'error')     throw new Error(evt.message);
+    if (evt.type === 'fetch')              { _onFetchEvent(evt); continue; }
+    if (evt.type === 'embedding')          { _onEmbeddingEvent(evt); continue; }
+    if (evt.type === 'embedding_progress') { _onEmbeddingProgressEvent(evt); continue; }
+    if (evt.type === 'done')               { _onDoneEvent(evt); continue; }
+    if (evt.type === 'error')              throw new Error(evt.message);
   }
 }
 
@@ -169,7 +178,7 @@ async function saveCollection() {
   _initSaveUI();
 
   try {
-    const res = await fetch('/collections/save-stream', {
+    const res = await authFetch('/collections/save-stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name, user_query: USER_QUERY, pubmed_query: PUBMED_QUERY, articles: selectedArticles }),
@@ -210,8 +219,16 @@ function setStep(index) {
   });
 }
 
-form.addEventListener('submit', function () {
+form.addEventListener('submit', function (e) {
   if (!document.getElementById('query').value.trim()) return;
+
+  const startDate = document.getElementById('start-date').value;
+  const endDate = document.getElementById('end-date').value;
+  if (startDate && endDate && startDate > endDate) {
+    e.preventDefault();
+    alert('Start date must be on or before the end date.');
+    return;
+  }
 
   btn.disabled = true;
   btn.textContent = 'Searching…';

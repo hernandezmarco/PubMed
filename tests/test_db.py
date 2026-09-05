@@ -47,9 +47,9 @@ def mock_conn():
 
 # ── db_conn context manager ───────────────────────────────────────────────────
 
-def _raise_inside_db_conn(exc: Exception):
+def _raise_inside_db_conn(exc_type: type[Exception], message: str):
     with db.db_conn():
-        raise exc
+        raise exc_type(message)
 
 
 class TestDbConn:
@@ -65,7 +65,7 @@ class TestDbConn:
         conn, _ = _make_conn()
         with patch("db._connect", return_value=conn):
             with pytest.raises(ValueError):
-                _raise_inside_db_conn(ValueError("boom"))
+                _raise_inside_db_conn(ValueError, "boom")
         conn.rollback.assert_called_once()
         conn.commit.assert_not_called()
 
@@ -73,7 +73,7 @@ class TestDbConn:
         conn, _ = _make_conn()
         with patch("db._connect", return_value=conn):
             with pytest.raises(RuntimeError):
-                _raise_inside_db_conn(RuntimeError("err"))
+                _raise_inside_db_conn(RuntimeError, "err")
         conn.close.assert_called_once()
 
     def test_connection_closed_on_success_too(self):
@@ -90,16 +90,16 @@ class TestCreateCollection:
     def test_returns_new_id(self):
         conn, _ = _make_conn(rows=[(42,)])
         with patch("db._connect", return_value=conn):
-            cid = db.create_collection("My Collection", "diabetes", "diabetes[MeSH]")
+            cid = db.create_collection("My Collection", "diabetes", "diabetes[MeSH]", 7)
         assert cid == 42
 
     def test_inserts_correct_values(self):
         conn, cur = _make_conn(rows=[(1,)])
         with patch("db._connect", return_value=conn):
-            db.create_collection("Name", "user q", "pubmed q")
+            db.create_collection("Name", "user q", "pubmed q", 7)
         sql, params = cur.execute.call_args.args
         assert "INSERT INTO rag_collections" in sql
-        assert params == ("Name", "user q", "pubmed q")
+        assert params == ("Name", "user q", "pubmed q", 7)
 
 
 # ── add_article ───────────────────────────────────────────────────────────────
@@ -162,7 +162,7 @@ class TestSaveChunks:
     def test_calls_execute_values(self, mock_conn):
         _, _ = mock_conn
         chunks = ["chunk one", "chunk two"]
-        embs = [np.zeros(384), np.ones(384)]
+        embs = [np.zeros(768), np.ones(768)]
         with patch("psycopg2.extras.execute_values") as mock_ev:
             db.save_chunks("pmid-1", chunks, embs)
         mock_ev.assert_called_once()
@@ -170,7 +170,7 @@ class TestSaveChunks:
     def test_data_indexed_correctly(self, mock_conn):
         _, _ = mock_conn
         chunks = ["alpha", "beta"]
-        embs = [np.array([0.1] * 384), np.array([0.2] * 384)]
+        embs = [np.array([0.1] * 768), np.array([0.2] * 768)]
         with patch("psycopg2.extras.execute_values") as mock_ev:
             db.save_chunks("pmid-2", chunks, embs)
         _, data = mock_ev.call_args.args[1], mock_ev.call_args.args[2]
@@ -180,7 +180,7 @@ class TestSaveChunks:
     def test_on_conflict_in_sql(self, mock_conn):
         _, _ = mock_conn
         with patch("psycopg2.extras.execute_values") as mock_ev:
-            db.save_chunks("p", ["c"], [np.zeros(384)])
+            db.save_chunks("p", ["c"], [np.zeros(768)])
         sql = mock_ev.call_args.args[1]
         assert "ON CONFLICT" in sql
         assert "DO NOTHING" in sql
@@ -219,7 +219,7 @@ class TestListCollections:
         conn, cur = _make_conn()
         cur.fetchall.return_value = [row]
         with patch("db._connect", return_value=conn):
-            result = db.list_collections()
+            result = db.list_collections(7)
         assert isinstance(result, list)
         assert result[0]["name"] == "C"
 
@@ -227,7 +227,7 @@ class TestListCollections:
         conn, cur = _make_conn()
         cur.fetchall.return_value = []
         with patch("db._connect", return_value=conn):
-            result = db.list_collections()
+            result = db.list_collections(7)
         assert result == []
 
 
@@ -241,23 +241,23 @@ class TestGetCollection:
         conn, cur = _make_conn()
         cur.fetchone.return_value = row
         with patch("db._connect", return_value=conn):
-            result = db.get_collection(5)
+            result = db.get_collection(5, 7)
         assert result["id"] == 5
 
     def test_returns_none_when_not_found(self):
         conn, cur = _make_conn()
         cur.fetchone.return_value = None
         with patch("db._connect", return_value=conn):
-            result = db.get_collection(999)
+            result = db.get_collection(999, 7)
         assert result is None
 
     def test_passes_cid_to_query(self):
         conn, cur = _make_conn()
         cur.fetchone.return_value = None
         with patch("db._connect", return_value=conn):
-            db.get_collection(77)
+            db.get_collection(77, 7)
         _, params = cur.execute.call_args.args
-        assert params == (77,)
+        assert params == (77, 7)
 
 
 # ── get_collection_articles ───────────────────────────────────────────────────
@@ -299,7 +299,7 @@ class TestSemanticSearch:
         conn, cur = _make_conn()
         cur.fetchall.return_value = [row]
         with patch("db._connect", return_value=conn):
-            results = db.semantic_search(1, np.zeros(384), k=1)
+            results = db.semantic_search(1, np.zeros(768), k=1)
         assert isinstance(results[0]["similarity"], float)
         assert results[0]["similarity"] == pytest.approx(0.850)
 
@@ -307,13 +307,13 @@ class TestSemanticSearch:
         conn, cur = _make_conn()
         cur.fetchall.return_value = []
         with patch("db._connect", return_value=conn):
-            results = db.semantic_search(1, np.zeros(384), k=5)
+            results = db.semantic_search(1, np.zeros(768), k=5)
         assert results == []
 
     def test_passes_embedding_and_cid(self):
         conn, cur = _make_conn()
         cur.fetchall.return_value = []
-        emb = np.ones(384)
+        emb = np.ones(768)
         with patch("db._connect", return_value=conn):
             db.semantic_search(7, emb, k=3)
         _, params = cur.execute.call_args.args
@@ -327,7 +327,7 @@ class TestSemanticSearch:
         conn, cur = _make_conn()
         cur.fetchall.return_value = rows
         with patch("db._connect", return_value=conn):
-            results = db.semantic_search(1, np.zeros(384))
+            results = db.semantic_search(1, np.zeros(768))
         for r in results:
             assert isinstance(r["similarity"], float)
 
@@ -337,10 +337,10 @@ class TestSemanticSearch:
 class TestDeleteCollection:
     def test_issues_delete(self, mock_conn):
         _, cur = mock_conn
-        db.delete_collection(5)
+        db.delete_collection(5, 7)
         sql, params = cur.execute.call_args.args
         assert "DELETE FROM rag_collections" in sql
-        assert params == (5,)
+        assert params == (5, 7)
 
 
 # ── create_conversation ───────────────────────────────────────────────────────

@@ -131,6 +131,9 @@ ENV/
 env.bak/
 venv.bak/
 
+# TLS certs (locally generated for Docker/gunicorn — never commit the private key)
+certs/
+
 # Spyder project settings
 .spyderproject
 .spyproject

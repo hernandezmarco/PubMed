@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+
+{% block title %}Register — PubMed AI{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{{ url_for('static', filename='auth.css') }}?v={{ static_version }}">
+{% endblock %}
+
+{% block header %}
+<h1>PubMed AI Search</h1>
+<p>Create an account</p>
+{% endblock %}
+
+{% block content %}
+<div class="container">
+  <div class="auth-card">
+    <h1>Register</h1>
+    <div class="auth-error" id="auth-error"></div>
+    <div class="auth-notice" id="auth-notice"></div>
+    <form id="register-form">
+      <div class="auth-field">
+        <label for="email">Email</label>
+        <input id="email" type="email" autocomplete="email" required>
+      </div>
+      <div class="auth-field">
+        <label for="password">Password</label>
+        <input id="password" type="password" autocomplete="new-password" minlength="8" required>
+      </div>
+      <button class="auth-submit" type="submit">Create account</button>
+    </form>
+    <p class="auth-switch">Already have an account? <a href="/login">Log in</a></p>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="{{ url_for('static', filename='auth.js') }}?v={{ static_version }}"></script>
+{% endblock %}

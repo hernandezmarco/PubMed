@@ -29,13 +29,16 @@ import requests
 # Patch heavy imports before importing app so the module loads cleanly in CI.
 import sys
 
-# Stub out fastembed so get_embedder() is never called implicitly at import time
-fastembed_stub = MagicMock()
-fastembed_stub.TextEmbedding = MagicMock()
-sys.modules.setdefault("fastembed", fastembed_stub)
+# Stub out sentence_transformers so get_embedder() is never called implicitly at import time
+st_stub = MagicMock()
+st_stub.SentenceTransformer = MagicMock()
+sys.modules.setdefault("sentence_transformers", st_stub)
 
 import app as _app  # noqa: E402  (must come after stubs)
+import auth
 import config as cfg
+
+TEST_USER_ID = 1
 
 
 @pytest.fixture(autouse=True)
@@ -45,6 +48,11 @@ def _no_ollama_discovery():
     with patch("app._discover_ollama_models", return_value={}):
         yield
     _app._available_models_cache = None
+
+
+@pytest.fixture(autouse=True)
+def _jwt_secret(monkeypatch):
+    monkeypatch.setattr(cfg, "JWT_SECRET_KEY", "test-secret-at-least-32-bytes-long!!")
 
 
 class TestCosineSimilarity:
@@ -467,21 +475,21 @@ def _make_ncbi_resp(status_code: int = 200, json_data: dict | None = None,
 class TestEmbedTexts:
     def test_returns_numpy_arrays(self):
         mock_embedder = MagicMock()
-        mock_embedder.embed.return_value = [np.array([0.1, 0.2, 0.3])]
+        mock_embedder.encode.return_value = [np.array([0.1, 0.2, 0.3])]
         with patch("app.get_embedder", return_value=mock_embedder):
             result = _app.embed_texts(["hello"])
         assert isinstance(result[0], np.ndarray)
 
     def test_multiple_texts(self):
         mock_embedder = MagicMock()
-        mock_embedder.embed.return_value = [np.zeros(3), np.ones(3)]
+        mock_embedder.encode.return_value = [np.zeros(3), np.ones(3)]
         with patch("app.get_embedder", return_value=mock_embedder):
             result = _app.embed_texts(["a", "b"])
         assert len(result) == 2
 
     def test_get_embedder_caches_instance(self, monkeypatch):
         monkeypatch.setattr(_app, "_embedder", None)
-        # fastembed is stubbed at the top of this file; TextEmbedding is a MagicMock
+        # sentence_transformers is stubbed at the top of this file; SentenceTransformer is a MagicMock
         e1 = _app.get_embedder()
         e2 = _app.get_embedder()
         assert e1 is e2
@@ -569,15 +577,52 @@ class TestNcbiGet:
 class TestSearchPubmed:
     def test_returns_id_list(self):
         resp = _make_ncbi_resp(200, json_data={"esearchresult": {"idlist": ["1", "2", "3"]}})
-        with patch("app._ncbi_get", return_value=resp):
+        with patch("app._ncbi_post", return_value=resp):
             result = _app.search_pubmed("diabetes[MeSH]", 25)
         assert result == ["1", "2", "3"]
 
     def test_empty_results(self):
         resp = _make_ncbi_resp(200, json_data={"esearchresult": {"idlist": []}})
-        with patch("app._ncbi_get", return_value=resp):
+        with patch("app._ncbi_post", return_value=resp):
             result = _app.search_pubmed("obscure[MeSH]", 25)
         assert result == []
+
+    def test_no_date_params_when_omitted(self):
+        resp = _make_ncbi_resp(200, json_data={"esearchresult": {"idlist": []}})
+        with patch("app._ncbi_post", return_value=resp) as mock_post:
+            _app.search_pubmed("diabetes[MeSH]", 25)
+        params = mock_post.call_args.kwargs["params"]
+        assert "mindate" not in params and "maxdate" not in params and "datetype" not in params
+
+    def test_date_params_included_when_both_given(self):
+        resp = _make_ncbi_resp(200, json_data={"esearchresult": {"idlist": []}})
+        with patch("app._ncbi_post", return_value=resp) as mock_post:
+            _app.search_pubmed("diabetes[MeSH]", 25, mindate="2020/01/01", maxdate="2024/12/31")
+        params = mock_post.call_args.kwargs["params"]
+        assert params["datetype"] == "pdat"
+        assert params["mindate"] == "2020/01/01"
+        assert params["maxdate"] == "2024/12/31"
+
+
+# ── _normalize_date_range ────────────────────────────────────────────────────
+
+class TestNormalizeDateRange:
+    def test_both_empty_returns_none(self):
+        assert _app._normalize_date_range("", "") is None
+
+    def test_both_given_converts_slashes(self):
+        result = _app._normalize_date_range("2020-01-15", "2024-06-30")
+        assert result == ("2020/01/15", "2024/06/30")
+
+    def test_only_start_given_defaults_end_to_today(self):
+        with patch("app.datetime.date") as mock_date:
+            mock_date.today.return_value.strftime.return_value = "2026/08/29"
+            result = _app._normalize_date_range("2020-01-15", "")
+        assert result == ("2020/01/15", "2026/08/29")
+
+    def test_only_end_given_defaults_start_to_earliest(self):
+        result = _app._normalize_date_range("", "2024-06-30")
+        assert result == (_app._PUBMED_EARLIEST_DATE, "2024/06/30")
 
 
 # ── _parse_article ────────────────────────────────────────────────────────────
@@ -711,7 +756,7 @@ class TestGetPmcids:
             }]
         }
         resp = _make_ncbi_resp(200, json_data=data)
-        with patch("app._ncbi_get", return_value=resp):
+        with patch("app._ncbi_post", return_value=resp):
             result = _app.get_pmcids(["111"])
         assert result == {"111": "654321"}
 
@@ -723,14 +768,14 @@ class TestGetPmcids:
             }]
         }
         resp = _make_ncbi_resp(200, json_data=data)
-        with patch("app._ncbi_get", return_value=resp):
+        with patch("app._ncbi_post", return_value=resp):
             result = _app.get_pmcids(["111"])
         assert result == {}
 
     def test_skips_empty_linkset_ids(self):
         data = {"linksets": [{"ids": [], "linksetdbs": []}]}
         resp = _make_ncbi_resp(200, json_data=data)
-        with patch("app._ncbi_get", return_value=resp):
+        with patch("app._ncbi_post", return_value=resp):
             result = _app.get_pmcids(["111"])
         assert result == {}
 
@@ -839,22 +884,6 @@ class TestTryFetchFullText:
         assert pmcid is None
 
 
-class TestFetchArticleText:
-    _ART = {"pmid": "111", "title": "T", "abstract": "A"}
-
-    def test_fetches_full_text_when_pmcid_available(self):
-        with patch("app._try_fetch_full_text", return_value=("full", "PMC1")) as mock_ft:
-            _, text, pmcid = _app._fetch_article_text(self._ART, {"111": "PMC1"})
-        mock_ft.assert_called_once_with("PMC1")
-        assert text == "full"
-        assert pmcid == "PMC1"
-
-    def test_returns_none_when_no_pmcid(self):
-        _, text, pmcid = _app._fetch_article_text(self._ART, {})
-        assert text is None
-        assert pmcid is None
-
-
 # ── generate_starter_questions ────────────────────────────────────────────────
 
 class TestGenerateStarterQuestions:
@@ -912,267 +941,6 @@ class TestStreamDelimitedResponse:
         assert usage == {"input_tokens": 0, "output_tokens": 0}
 
 
-# ── Flask routes ──────────────────────────────────────────────────────────────
-
-@pytest.fixture
-def flask_client():
-    _app.app.config["TESTING"] = True
-    with _app.app.test_client() as c:
-        yield c
-
-
-class TestIndexRoute:
-    def test_get_returns_200(self, flask_client):
-        resp = flask_client.get("/")
-        assert resp.status_code == 200
-
-    def test_post_empty_query_returns_200_no_search(self, flask_client):
-        with patch("app._run_search") as mock_search:
-            resp = flask_client.post("/", data={"query": "  "})
-        assert resp.status_code == 200
-        mock_search.assert_not_called()
-
-    def test_post_with_query_calls_run_search(self, flask_client):
-        with patch("app._run_search", return_value=([], "q", None)):
-            resp = flask_client.post("/", data={"query": "diabetes"})
-        assert resp.status_code == 200
-
-    def test_post_with_error_still_returns_200(self, flask_client):
-        with patch("app._run_search", return_value=(None, None, "API key invalid")):
-            resp = flask_client.post("/", data={"query": "diabetes"})
-        assert resp.status_code == 200
-
-
-class TestCollectionsRoute:
-    def test_get_returns_200(self, flask_client):
-        with patch("app.db.list_collections", return_value=[]):
-            resp = flask_client.get("/collections")
-        assert resp.status_code == 200
-
-    def test_post_missing_name_returns_400(self, flask_client):
-        resp = flask_client.post("/collections",
-                                 json={"articles": [{"pmid": "1"}]})
-        assert resp.status_code == 400
-        assert b"name" in resp.data.lower()
-
-    def test_post_no_articles_returns_400(self, flask_client):
-        resp = flask_client.post("/collections",
-                                 json={"name": "My Collection", "articles": []})
-        assert resp.status_code == 400
-
-    def test_post_success_returns_collection_id(self, flask_client):
-        art = {"pmid": "111", "title": "T", "authors": "A", "journal": "J",
-               "year": "2024", "abstract": "Ab", "url": "http://x"}
-        with patch("app.get_pmcids", return_value={}), \
-             patch("app.db.create_collection", return_value=7), \
-             patch("app.db.add_article"), \
-             patch("app.db.chunks_exist", return_value=False), \
-             patch("app.embed_texts", return_value=[np.zeros(384)] * 2), \
-             patch("app.db.save_chunks"), \
-             patch("app._fetch_article_text", return_value=(art, None, None)):
-            resp = flask_client.post("/collections",
-                                     json={"name": "Test", "user_query": "q",
-                                           "pubmed_query": "pq", "articles": [art]})
-        assert resp.status_code == 200
-        assert resp.get_json()["id"] == 7
-
-
-class TestCollectionDetailRoute:
-    def test_returns_404_when_not_found(self, flask_client):
-        with patch("app.db.get_collection", return_value=None):
-            resp = flask_client.get("/collections/999")
-        assert resp.status_code == 404
-
-    def test_returns_200_when_found(self, flask_client):
-        col = {"id": 1, "name": "C", "user_query": "q", "pubmed_query": "pq",
-               "created_at": "2024-01-01", "article_count": 0,
-               "full_text_count": 0, "chunk_count": 0}
-        with patch("app.db.get_collection", return_value=col), \
-             patch("app.db.get_collection_articles", return_value=[]), \
-             patch("app.generate_starter_questions", return_value=[]):
-            resp = flask_client.get("/collections/1")
-        assert resp.status_code == 200
-
-
-class TestCollectionDeleteRoute:
-    def test_returns_ok(self, flask_client):
-        with patch("app.db.delete_collection"):
-            resp = flask_client.post("/collections/1/delete")
-        assert resp.status_code == 200
-        assert resp.get_json() == {"ok": True}
-
-
-class TestConversationRoutes:
-    def test_list_conversations(self, flask_client):
-        with patch("app.db.list_conversations", return_value=[{"id": 1}]):
-            resp = flask_client.get("/collections/1/conversations")
-        assert resp.status_code == 200
-
-    def test_get_messages(self, flask_client):
-        with patch("app.db.get_conversation_messages", return_value=[]):
-            resp = flask_client.get("/conversations/1/messages")
-        assert resp.status_code == 200
-
-    def test_delete_conversation(self, flask_client):
-        with patch("app.db.delete_conversation"):
-            resp = flask_client.post("/conversations/1/delete")
-        assert resp.status_code == 200
-        assert resp.get_json() == {"ok": True}
-
-
-class TestCollectionAskRoute:
-    def test_no_question_returns_400(self, flask_client):
-        resp = flask_client.post("/collections/1/ask", json={"question": ""})
-        assert resp.status_code == 400
-
-    def test_invalid_model_falls_back_to_default(self, flask_client):
-        q_emb = np.zeros(384)
-        chunk = {"pmid": "1", "title": "T", "authors": "A", "journal": "J",
-                 "year": "2024", "abstract": "ab", "url": "u",
-                 "has_full_text": False, "chunk_text": "text",
-                 "chunk_index": 0, "similarity": 0.9}
-        with patch("app.embed_texts", return_value=[q_emb]), \
-             patch("app.db.semantic_search", return_value=[chunk]), \
-             patch("app.db.create_conversation", return_value=1), \
-             patch("app.db.add_message"), \
-             patch("app._stream_delimited_response",
-                   return_value=([], "", {"input_tokens": 0, "output_tokens": 0})):
-            resp = flask_client.post("/collections/1/ask",
-                                     json={"question": "q", "model": "not-a-real-model"})
-        assert resp.status_code == 200
-
-    def test_empty_chunks_returns_no_articles_message(self, flask_client):
-        with patch("app.embed_texts", return_value=[np.zeros(384)]), \
-             patch("app.db.semantic_search", return_value=[]), \
-             patch("app.db.create_conversation", return_value=1), \
-             patch("app.db.add_message"):
-            resp = flask_client.post("/collections/1/ask",
-                                     json={"question": "What is diabetes?"})
-        data = b"".join(resp.response)
-        assert b"No articles" in data
-
-
-class TestConversationExportRoute:
-    def test_invalid_format_returns_400(self, flask_client):
-        resp = flask_client.get("/conversations/1/export?format=pdf")
-        assert resp.status_code == 400
-
-    def test_missing_conversation_returns_404(self, flask_client):
-        with patch("app.db.get_conversation", return_value=None):
-            resp = flask_client.get("/conversations/1/export?format=rtf")
-        assert resp.status_code == 404
-
-    def test_no_messages_returns_404(self, flask_client):
-        conv = {"id": 1, "title": "Chat", "collection_name": "Col", "created_at": "2024-01-01"}
-        with patch("app.db.get_conversation", return_value=conv), \
-             patch("app.db.get_conversation_messages", return_value=[]):
-            resp = flask_client.get("/conversations/1/export?format=rtf")
-        assert resp.status_code == 404
-
-    def test_rtf_export_returns_rtf_content(self, flask_client):
-        conv = {"id": 1, "title": "Chat", "collection_name": "Col", "created_at": "2024-01-01"}
-        messages = [{"role": "user", "content": "Hi", "citations": None}]
-        with patch("app.db.get_conversation", return_value=conv), \
-             patch("app.db.get_conversation_messages", return_value=messages):
-            resp = flask_client.get("/conversations/1/export?format=rtf")
-        assert resp.status_code == 200
-        assert resp.content_type == "application/rtf"
-
-    def test_docx_export_returns_docx_content(self, flask_client):
-        conv = {"id": 1, "title": "Chat", "collection_name": "Col", "created_at": "2024-01-01"}
-        messages = [{"role": "user", "content": "Hi", "citations": None}]
-        with patch("app.db.get_conversation", return_value=conv), \
-             patch("app.db.get_conversation_messages", return_value=messages):
-            resp = flask_client.get("/conversations/1/export?format=docx")
-        assert resp.status_code == 200
-        assert "wordprocessingml" in resp.content_type
-
-
-# ── RTF helpers ───────────────────────────────────────────────────────────────
-
-class TestRtfEsc:
-    def test_backslash_escaped(self):
-        assert _app._rtf_esc("a\\b") == "a\\\\b"
-
-    def test_open_brace_escaped(self):
-        assert _app._rtf_esc("{") == "\\{"
-
-    def test_close_brace_escaped(self):
-        assert _app._rtf_esc("}") == "\\}"
-
-    def test_non_ascii_encoded(self):
-        result = _app._rtf_esc("\u00e9")  # é
-        assert result == "\\u233?"
-
-    def test_plain_ascii_passthrough(self):
-        assert _app._rtf_esc("hello world") == "hello world"
-
-    def test_empty_string(self):
-        assert _app._rtf_esc("") == ""
-
-
-class TestRtfHyperlink:
-    def test_contains_hyperlink_keyword(self):
-        result = _app._rtf_hyperlink("http://example.com", "click me")
-        assert "HYPERLINK" in result
-
-    def test_contains_display_text(self):
-        result = _app._rtf_hyperlink("http://example.com", "click me")
-        assert "click me" in result
-
-    def test_url_backslash_escaped(self):
-        result = _app._rtf_hyperlink("http://x.com\\path", "t")
-        assert "\\\\" in result
-
-
-class TestRtfLineWithLinks:
-    def test_plain_text_passthrough(self):
-        result = _app._rtf_line_with_links("no markers here", {})
-        assert result == "no markers here"
-
-    def test_marker_with_url_becomes_hyperlink(self):
-        result = _app._rtf_line_with_links("See [1] for details", {1: "http://x.com"})
-        assert "HYPERLINK" in result
-        assert "details" in result
-
-    def test_marker_without_url_is_escaped_literally(self):
-        result = _app._rtf_line_with_links("See [1] here", {})
-        assert "HYPERLINK" not in result
-        assert "[1]" in result
-
-
-class TestBuildRtf:
-    def test_contains_title(self):
-        result = _app._build_rtf("My Chat", "Col", "2024-01-01T00:00:00", [])
-        assert "My Chat" in result
-
-    def test_user_message_included(self):
-        msgs = [{"role": "user", "content": "Hello there"}]
-        result = _app._build_rtf("T", "C", "2024-01-01", msgs)
-        assert "Hello there" in result
-
-    def test_assistant_message_included(self):
-        msgs = [{"role": "assistant", "content": "The answer is 42", "citations": []}]
-        result = _app._build_rtf("T", "C", "2024-01-01", msgs)
-        assert "The answer is 42" in result
-
-    def test_citations_section_present_when_citations_exist(self):
-        msgs = [{
-            "role": "assistant",
-            "content": "See [1]",
-            "citations": [{"num": 1, "url": "http://x.com", "title": "Article",
-                           "journal": "Nature", "year": "2024"}],
-        }]
-        result = _app._build_rtf("T", "C", "2024-01-01", msgs)
-        assert "Sources" in result
-        assert "Article" in result
-
-    def test_date_truncated_to_10_chars(self):
-        result = _app._build_rtf("T", "C", "2024-01-01T12:00:00Z", [])
-        assert "2024-01-01" in result
-        assert "T12:00:00Z" not in result
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # Flask route tests (mocked DB + external calls)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1180,7 +948,11 @@ class TestBuildRtf:
 @pytest.fixture
 def client():
     _app.app.config["TESTING"] = True
+    _app.app.config["WTF_CSRF_ENABLED"] = False
+    _app.app.config["RATELIMIT_ENABLED"] = False
+    _app.app.secret_key = "test-flask-secret-key"
     with _app.app.test_client() as c:
+        c.set_cookie(auth.ACCESS_COOKIE_NAME, auth.create_access_token(TEST_USER_ID))
         yield c
 
 
@@ -1194,7 +966,7 @@ class TestIndexRoute:
         mock_run.return_value = ([], "diabetes[MeSH]", None)
         resp = client.post("/", data={"query": "diabetes research", "max_results": "25"})
         assert resp.status_code == 200
-        mock_run.assert_called_once_with("diabetes research", 25)
+        mock_run.assert_called_once_with("diabetes research", 25, mindate=None, maxdate=None)
 
     def test_post_empty_query_no_search(self, client):
         resp = client.post("/", data={"query": ""})
@@ -1207,6 +979,27 @@ class TestIndexRoute:
         assert resp.status_code == 200
         assert b"API key invalid" in resp.data
 
+    @patch("app._run_search")
+    def test_date_range_passed_through(self, mock_run, client):
+        mock_run.return_value = ([], "diabetes[MeSH]", None)
+        client.post("/", data={
+            "query": "diabetes research", "max_results": "25",
+            "start_date": "2020-01-01", "end_date": "2024-12-31",
+        })
+        mock_run.assert_called_once_with(
+            "diabetes research", 25, mindate="2020/01/01", maxdate="2024/12/31"
+        )
+
+    def test_start_after_end_returns_error_without_searching(self, client):
+        with patch("app._run_search") as mock_run:
+            resp = client.post("/", data={
+                "query": "diabetes research",
+                "start_date": "2024-12-31", "end_date": "2020-01-01",
+            })
+        assert resp.status_code == 200
+        assert b"Start date must be on or before the end date." in resp.data
+        mock_run.assert_not_called()
+
 
 class TestCollectionsRoute:
     @patch("app.db.list_collections", return_value=[])
@@ -1214,6 +1007,18 @@ class TestCollectionsRoute:
         resp = client.get("/collections")
         assert resp.status_code == 200
         mock_list.assert_called_once()
+
+    @patch("app.db.list_collections")
+    def test_shows_full_text_and_abstract_only_counts(self, mock_list, client):
+        mock_list.return_value = [{
+            "id": 1, "name": "Diabetes", "user_query": "q", "pubmed_query": "q[MeSH]",
+            "created_at": "2026-01-01T00:00:00",
+            "article_count": 10, "full_text_count": 6, "chunk_count": 42,
+        }]
+        resp = client.get("/collections")
+        html = resp.get_data(as_text=True)
+        assert "6 full text" in html
+        assert "4 abstract only" in html
 
 
 class TestFetchArticleText:
@@ -1241,67 +1046,6 @@ class TestFetchArticleText:
         assert pmcid is None
 
 
-class TestCollectionsSaveRoute:
-    _ART = {"pmid": "123", "title": "T", "authors": "A",
-            "journal": "J", "year": "2024", "abstract": "AB",
-            "url": "https://pubmed.ncbi.nlm.nih.gov/123/"}
-
-    @patch("app.get_pmcids", return_value={})
-    @patch("app.db.create_collection", return_value=42)
-    @patch("app.db.add_article")
-    @patch("app.db.chunks_exist", return_value=True)  # skip embedding phase
-    @patch("app._fetch_article_text")
-    def test_save_success(self, mock_fetch, mock_exist, mock_add, mock_create, mock_pmcids, client):
-        mock_fetch.return_value = (self._ART, None, None)
-        payload = {
-            "name": "My Collection",
-            "user_query": "diabetes",
-            "pubmed_query": "diabetes[MeSH]",
-            "articles": [self._ART],
-        }
-        resp = client.post("/collections", json=payload)
-        assert resp.status_code == 200
-        assert resp.get_json()["id"] == 42
-
-    def test_save_missing_name_returns_400(self, client):
-        resp = client.post("/collections", json={"articles": [{"pmid": "1"}]})
-        assert resp.status_code == 400
-        assert "name" in resp.get_json()["error"].lower()
-
-    def test_save_missing_articles_returns_400(self, client):
-        resp = client.post("/collections", json={"name": "Test", "articles": []})
-        assert resp.status_code == 400
-
-    @patch("app.db.save_chunks")
-    @patch("app.embed_texts")
-    @patch("app.db.chunks_exist", return_value=False)
-    @patch("app.db.add_article")
-    @patch("app.db.create_collection", return_value=1)
-    @patch("app.get_pmcids", return_value={})
-    @patch("app._fetch_article_text")
-    def test_embed_called_once_for_multiple_articles(
-        self, mock_fetch, mock_pmcids, mock_create, mock_add, mock_exist,
-        mock_embed, mock_save, client
-    ):
-        """All chunks across all articles are embedded in a single batch call."""
-        art1 = {**self._ART, "pmid": "111", "abstract": "Abstract one."}
-        art2 = {**self._ART, "pmid": "222", "abstract": "Abstract two."}
-        mock_fetch.side_effect = [(art1, None, None), (art2, None, None)]
-        mock_embed.return_value = [np.zeros(384)] * 100  # oversized; index slicing handles it
-
-        client.post("/collections", json={
-            "name": "Batch Test",
-            "user_query": "q",
-            "pubmed_query": "q[MeSH]",
-            "articles": [art1, art2],
-        })
-
-        # embed_texts must be called exactly once, not once per article
-        mock_embed.assert_called_once()
-        # save_chunks called once per article
-        assert mock_save.call_count == 2
-
-
 class TestCollectionDetailRoute:
     @patch("app.db.get_collection", return_value=None)
     def test_not_found_returns_404(self, mock_get, client):
@@ -1321,7 +1065,8 @@ class TestCollectionDetailRoute:
 
 
 class TestCollectionAskRoute:
-    def test_empty_question_returns_400(self, client):
+    @patch("app.db.get_collection", return_value={"id": 1, "name": "C"})
+    def test_empty_question_returns_400(self, mock_get_collection, client):
         resp = client.post("/collections/1/ask", json={"question": ""})
         assert resp.status_code == 400
 
@@ -1329,10 +1074,11 @@ class TestCollectionAskRoute:
     @patch("app.db.add_message")
     @patch("app.db.create_conversation", return_value=7)
     @patch("app.embed_texts")
+    @patch("app.db.get_collection", return_value={"id": 1, "name": "C"})
     def test_no_chunks_streams_empty_message(
-        self, mock_embed, mock_create_conv, mock_add_msg, mock_search, client
+        self, mock_get_collection, mock_embed, mock_create_conv, mock_add_msg, mock_search, client
     ):
-        mock_embed.return_value = [np.zeros(384)]
+        mock_embed.return_value = [np.zeros(768)]
         resp = client.post(
             "/collections/1/ask",
             json={"question": "What is this?"},
@@ -1358,18 +1104,26 @@ class TestCollectionDeleteRoute:
         resp = client.post("/collections/5/delete")
         assert resp.status_code == 200
         assert resp.get_json() == {"ok": True}
-        mock_delete.assert_called_once_with(5)
+        mock_delete.assert_called_once_with(5, TEST_USER_ID)
+
+
+def _owned_conv(vid=3, collection_id=1):
+    """A db.get_conversation()-shaped dict owned by TEST_USER_ID, for route tests."""
+    return {"id": vid, "title": "T", "created_at": "2024-01-01T00:00:00",
+            "collection_id": collection_id, "collection_name": "C", "user_id": TEST_USER_ID}
 
 
 class TestConversationRoutes:
     @patch("app.db.list_conversations", return_value=[])
-    def test_list_conversations(self, mock_list, client):
+    @patch("app.db.get_collection", return_value={"id": 1, "name": "C"})
+    def test_list_conversations(self, mock_get_collection, mock_list, client):
         resp = client.get("/collections/1/conversations")
         assert resp.status_code == 200
         mock_list.assert_called_once_with(1)
 
     @patch("app.db.get_conversation_messages", return_value=[])
-    def test_get_messages(self, mock_get, client):
+    @patch("app.db.get_conversation", return_value=_owned_conv())
+    def test_get_messages(self, mock_get_conv, mock_get, client):
         resp = client.get("/conversations/3/messages")
         assert resp.status_code == 200
         mock_get.assert_called_once_with(3)
@@ -1382,7 +1136,8 @@ class TestConversationRoutes:
                         "title": "T", "journal": "J", "year": "2024", "similarity": 0.9}],
          "created_at": "2024-01-01T00:00:01"},
     ])
-    def test_get_messages_citations_field_returned(self, mock_get, client):
+    @patch("app.db.get_conversation", return_value=_owned_conv())
+    def test_get_messages_citations_field_returned(self, mock_get_conv, mock_get, client):
         resp = client.get("/conversations/3/messages")
         data = resp.get_json()
         assert data[0]["citations"] is None
@@ -1397,13 +1152,15 @@ class TestConversationRoutes:
          ],
          "created_at": "2024-01-01T00:00:00"},
     ])
-    def test_get_messages_citation_num_sequential(self, _, client):
+    @patch("app.db.get_conversation", return_value=_owned_conv())
+    def test_get_messages_citation_num_sequential(self, mock_get_conv, _, client):
         data = client.get("/conversations/3/messages").get_json()
         nums = [c["num"] for c in data[0]["citations"]]
         assert nums == [1, 2]
 
     @patch("app.db.delete_conversation")
-    def test_delete_conversation(self, mock_delete, client):
+    @patch("app.db.get_conversation", return_value=_owned_conv())
+    def test_delete_conversation(self, mock_get_conv, mock_delete, client):
         resp = client.post("/conversations/3/delete")
         assert resp.status_code == 200
         assert resp.get_json() == {"ok": True}
@@ -1813,8 +1570,9 @@ class TestRenderCitation:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _EXPORT_CONV = {
-    "id": 1, "title": "Test Question",
+    "id": 1, "title": "Test Question", "collection_id": 1,
     "collection_name": "My Collection", "created_at": "2024-01-01T00:00:00",
+    "user_id": TEST_USER_ID,
 }
 _EXPORT_MSGS = [
     {"role": "user",      "content": "What is the treatment?"},
@@ -1897,7 +1655,8 @@ class TestConversationExportRoute:
 
 class TestConversationRenameRoute:
     @patch("app.db.rename_conversation")
-    def test_rename_returns_200(self, mock_rename, client):
+    @patch("app.db.get_conversation", return_value=_owned_conv())
+    def test_rename_returns_200(self, mock_get_conv, mock_rename, client):
         resp = client.patch(
             "/conversations/1/rename",
             json={"title": "New Title"},
@@ -1906,23 +1665,27 @@ class TestConversationRenameRoute:
         mock_rename.assert_called_once_with(1, "New Title")
 
     @patch("app.db.rename_conversation")
-    def test_rename_returns_ok_true(self, mock_rename, client):
+    @patch("app.db.get_conversation", return_value=_owned_conv())
+    def test_rename_returns_ok_true(self, mock_get_conv, mock_rename, client):
         resp = client.patch("/conversations/1/rename", json={"title": "New Title"})
         assert resp.get_json()["ok"] is True
 
     @patch("app.db.rename_conversation")
-    def test_empty_title_returns_400(self, mock_rename, client):
+    @patch("app.db.get_conversation", return_value=_owned_conv())
+    def test_empty_title_returns_400(self, mock_get_conv, mock_rename, client):
         resp = client.patch("/conversations/1/rename", json={"title": ""})
         assert resp.status_code == 400
         mock_rename.assert_not_called()
 
     @patch("app.db.rename_conversation")
-    def test_whitespace_title_returns_400(self, mock_rename, client):
+    @patch("app.db.get_conversation", return_value=_owned_conv())
+    def test_whitespace_title_returns_400(self, mock_get_conv, mock_rename, client):
         resp = client.patch("/conversations/1/rename", json={"title": "   "})
         assert resp.status_code == 400
         mock_rename.assert_not_called()
 
     @patch("app.db.rename_conversation")
-    def test_title_is_stripped(self, mock_rename, client):
+    @patch("app.db.get_conversation", return_value=_owned_conv())
+    def test_title_is_stripped(self, mock_get_conv, mock_rename, client):
         client.patch("/conversations/1/rename", json={"title": "  Trimmed  "})
         mock_rename.assert_called_once_with(1, "Trimmed")

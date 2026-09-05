@@ -43,7 +43,7 @@ const PROVIDER_LABELS = {
 
 async function loadModels() {
   try {
-    const res  = await fetch('/api/models');
+    const res  = await authFetch('/api/models');
     const data = await res.json();
     const models = data.models || [];
 
@@ -279,7 +279,7 @@ function finalizeMsgWithCitations(msgEl, citations, suggestions, usage) {
 // ── Conversation sidebar ──────────────────────────────────────────────────────
 async function loadConversations() {
   try {
-    const res  = await fetch(`/collections/${COLLECTION_ID}/conversations`);
+    const res  = await authFetch(`/collections/${COLLECTION_ID}/conversations`);
     const list = await res.json();
     renderConversationList(list);
     if (list.length > 0) {
@@ -322,7 +322,7 @@ function renderConversationList(list) {
     item.querySelector('.conv-delete').addEventListener('click', async e => {
       e.stopPropagation();
       if (!confirm('Delete this conversation?')) return;
-      await fetch(`/conversations/${c.id}/delete`, { method: 'POST' });
+      await authFetch(`/conversations/${c.id}/delete`, { method: 'POST' });
       if (currentConversationId === c.id) newConversation();
       await refreshConversationList();
     });
@@ -333,7 +333,7 @@ function renderConversationList(list) {
 
 async function refreshConversationList() {
   try {
-    const res  = await fetch(`/collections/${COLLECTION_ID}/conversations`);
+    const res  = await authFetch(`/collections/${COLLECTION_ID}/conversations`);
     const list = await res.json();
     renderConversationList(list);
   } catch (err) {
@@ -351,7 +351,7 @@ async function loadConversation(vid) {
   });
 
   try {
-    const res      = await fetch(`/conversations/${vid}/messages`);
+    const res      = await authFetch(`/conversations/${vid}/messages`);
     const messages = await res.json();
 
     chatMessages.innerHTML = '';
@@ -427,7 +427,7 @@ function _showAskError(answerEl, msgEl, message) {
 }
 
 async function _postQuestion(question) {
-  const res = await fetch(`/collections/${COLLECTION_ID}/ask`, {
+  const res = await authFetch(`/collections/${COLLECTION_ID}/ask`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ question, model: modelSelect.value, conversation_id: currentConversationId }),
@@ -524,7 +524,7 @@ function startRename(item, convId, currentTitle) {
     done = true;
     const newTitle = input.value.trim();
     if (newTitle && newTitle !== currentTitle) {
-      await fetch(`/conversations/${convId}/rename`, {
+      await authFetch(`/conversations/${convId}/rename`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ title: newTitle }),
@@ -568,7 +568,7 @@ function buildStarterRow(questions) {
 
 async function loadStarterQuestions() {
   try {
-    const res  = await fetch(`/collections/${COLLECTION_ID}/starter-questions`);
+    const res  = await authFetch(`/collections/${COLLECTION_ID}/starter-questions`);
     const data = await res.json();
     starterQuestions = data.questions || [];
     const loading = document.getElementById('starter-loading');

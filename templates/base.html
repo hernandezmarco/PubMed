@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="csrf-token" content="{{ csrf_token() }}">
   <title>{% block title %}PubMed AI Search{% endblock %}</title>
   <link rel="icon" type="image/x-icon" href="{{ url_for('static', filename='favicon.ico') }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='base.css') }}?v={{ static_version }}">
@@ -10,8 +11,16 @@
 </head>
 <body>
 <div id="progress-bar"></div>
-<header>{% block header %}{% endblock %}</header>
-{% block breadcrumb %}{% endblock %}
+<div class="site-top">
+  {% if current_user_email %}
+  <div class="account-bar">
+    <span class="account-email">{{ current_user_email }}</span>
+    <button id="logout-btn" class="account-logout" type="button">Log out</button>
+  </div>
+  {% endif %}
+  <header>{% block header %}{% endblock %}</header>
+  {% block breadcrumb %}{% endblock %}
+</div>
 {% block content %}{% endblock %}
 <footer>
   <p>&copy; 2026 Marco A. Hernandez, Digital Hammer LLC. Licensed under the

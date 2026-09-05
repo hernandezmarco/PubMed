@@ -13,12 +13,15 @@
 # For information contact Marco Hernandez <ragettyandy@gmail.com>
 
 import csv
+import datetime
 import io
 import json
 import logging
 import logging.handlers
 import os
 import re
+import secrets
+import threading
 import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -31,9 +34,13 @@ from docx import Document
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import RGBColor
-from flask import Flask, Response, jsonify, render_template, request, stream_with_context
+from flask import Flask, Response, g, jsonify, make_response, redirect, render_template, request, stream_with_context, url_for
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from flask_wtf import CSRFProtect
 from dotenv import load_dotenv
 
+import auth
 import db
 import config as cfg
 
@@ -80,9 +87,15 @@ _SSE_MIMETYPE = "text/event-stream"
 
 app = Flask(__name__)
 app.jinja_env.globals["static_version"] = cfg.STATIC_VERSION
-# No CSRF protection (flask-wtf): no session/cookie-based auth exists anywhere in this
-# app, so there's no ambient credential for a forged cross-site request to ride. Revisit
-# if login/session auth is ever added.
+app.secret_key = cfg.FLASK_SECRET_KEY
+if not cfg.FLASK_SECRET_KEY:
+    _log.warning(
+        "FLASK_SECRET_KEY is not set — the session (and CSRF tokens riding on it) "
+        "won't work. Set FLASK_SECRET_KEY in your .env before relying on this for anything real."
+    )
+csrf = CSRFProtect(app)
+
+limiter = Limiter(key_func=get_remote_address, app=app, storage_uri="memory://")
 
 # ── Available models (resolved once at first request) ─────────────────────────
 
@@ -155,21 +168,29 @@ def available_chat_models() -> dict[str, dict]:
 # ── Embeddings ────────────────────────────────────────────────────────────────
 
 _embedder = None
+_embedder_lock = threading.Lock()
 
 
 def get_embedder():
     global _embedder
     if _embedder is None:
-        from fastembed import TextEmbedding
-        _embedder = TextEmbedding(cfg.EMBEDDING_MODEL, threads=cfg.EMBED_THREADS)
-        _embed_log.info("Embedder loaded model=%s threads=%d", cfg.EMBEDDING_MODEL, cfg.EMBED_THREADS)
+        # gthread workers can run multiple requests concurrently in the same process,
+        # so first-use lazy init needs a lock to avoid double-loading the model.
+        with _embedder_lock:
+            if _embedder is None:
+                import torch
+                from sentence_transformers import SentenceTransformer
+                torch.set_num_threads(cfg.EMBED_THREADS)
+                _embedder = SentenceTransformer(cfg.EMBEDDING_MODEL, device="cpu")
+                _embed_log.info("Embedder loaded model=%s threads=%d", cfg.EMBEDDING_MODEL, cfg.EMBED_THREADS)
     return _embedder
 
 
 def embed_texts(texts: list[str]) -> list[np.ndarray]:
     _embed_log.debug("Embedding %d text(s)", len(texts))
     t0 = time.perf_counter()
-    result = [np.array(v, dtype=np.float32) for v in get_embedder().embed(texts, batch_size=cfg.EMBED_BATCH_SIZE)]
+    vectors = get_embedder().encode(texts, batch_size=cfg.EMBED_BATCH_SIZE)
+    result = [np.array(v, dtype=np.float32) for v in vectors]
     elapsed = time.perf_counter() - t0
     dim = len(result[0]) if result else 0
     _embed_log.info("Embedded texts=%d dim=%d duration=%.3fs", len(texts), dim, elapsed)
@@ -279,12 +300,16 @@ def _ncbi_post(url: str, params: dict, timeout: int, max_retries: int = 4) -> re
             delay = min(delay * 2, cfg.NCBI_BACKOFF_MAX)
 
 
-def search_pubmed(query: str, max_results: int = 25) -> list[str]:
-    _api_log.debug("op=esearch query=%r max=%d", query[:120], max_results)
+def search_pubmed(query: str, max_results: int = 25, mindate: str | None = None, maxdate: str | None = None) -> list[str]:
+    _api_log.debug("op=esearch query=%r max=%d mindate=%s maxdate=%s", query[:120], max_results, mindate, maxdate)
     t0 = time.perf_counter()
+    params = {"db": "pubmed", "term": query, "retmax": max_results, "retmode": "json", "sort": "relevance"}
+    if mindate and maxdate:
+        # datetype=pdat filters by publication date; mindate/maxdate must be given together.
+        params.update({"datetype": "pdat", "mindate": mindate, "maxdate": maxdate})
     resp = _ncbi_post(
         f"{cfg.PUBMED_BASE}/esearch.fcgi",
-        params={"db": "pubmed", "term": query, "retmax": max_results, "retmode": "json", "sort": "relevance"},
+        params=params,
         timeout=cfg.TIMEOUT_ESEARCH,
     )
     resp.raise_for_status()
@@ -455,6 +480,22 @@ def _clamp_max_results(raw: str) -> int:
     return max(cfg.MAX_RESULTS_MIN, min(cfg.MAX_RESULTS_MAX, (value // cfg.MAX_RESULTS_MIN) * cfg.MAX_RESULTS_MIN))
 
 
+# PubMed's indexing effectively starts here — used as the open lower bound when only an
+# end date is picked.
+_PUBMED_EARLIEST_DATE = "1800/01/01"
+
+
+def _normalize_date_range(start_date: str, end_date: str) -> tuple[str, str] | None:
+    """Convert HTML date-input values (YYYY-MM-DD) to PubMed's mindate/maxdate format
+    (YYYY/MM/DD). Returns None if neither bound was given; fills in an open bound
+    (earliest possible / today) when only one side was picked."""
+    if not start_date and not end_date:
+        return None
+    mindate = start_date.replace("-", "/") if start_date else _PUBMED_EARLIEST_DATE
+    maxdate = end_date.replace("-", "/") if end_date else datetime.date.today().strftime("%Y/%m/%d")
+    return mindate, maxdate
+
+
 def _attach_similarities(user_query: str, results: list[dict]):
     query_emb = embed_texts([user_query])[0]
     article_texts = [f"{a['title']}. {a['abstract']}" for a in results]
@@ -463,11 +504,13 @@ def _attach_similarities(user_query: str, results: list[dict]):
         art["similarity"] = round(cosine_similarity(query_emb, emb), 3)
 
 
-def _run_search(user_query: str, max_results: int) -> tuple[list[dict] | None, str | None, str | None]:
+def _run_search(
+    user_query: str, max_results: int, mindate: str | None = None, maxdate: str | None = None
+) -> tuple[list[dict] | None, str | None, str | None]:
     """Return (results, pubmed_query, error)."""
     try:
         pubmed_query = build_pubmed_query(user_query)
-        pmids = search_pubmed(pubmed_query, max_results)
+        pmids = search_pubmed(pubmed_query, max_results, mindate, maxdate)
         results = fetch_articles(pmids)
         if results:
             _attach_similarities(user_query, results)
@@ -480,19 +523,241 @@ def _run_search(user_query: str, max_results: int) -> tuple[list[dict] | None, s
         return None, None, str(exc)
 
 
+@app.context_processor
+def inject_current_user():
+    """Makes current_user_email available to every template (None when logged out)."""
+    if getattr(g, "user_id", None) is None:
+        return {"current_user_email": None}
+    user = db.get_user_by_id(g.user_id)
+    return {"current_user_email": user["email"] if user else None}
+
+
+def _issue_auth_cookies(user_id: int) -> Response:
+    """Set the access + refresh cookies for a freshly authenticated user_id."""
+    access_token = auth.create_access_token(user_id)
+    refresh_token = secrets.token_urlsafe(32)
+    refresh_expires = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+        days=cfg.JWT_REFRESH_TTL_DAYS
+    )
+    db.create_refresh_token(user_id, auth.hash_token(refresh_token), refresh_expires)
+
+    resp = make_response(jsonify({"ok": True}))
+    resp.set_cookie(
+        auth.ACCESS_COOKIE_NAME, access_token,
+        httponly=True, secure=cfg.COOKIE_SECURE, samesite="Lax",
+        max_age=cfg.JWT_ACCESS_TTL_MINUTES * 60,
+    )
+    # Scoped to /auth so it's only ever sent to the refresh/logout endpoints, not on
+    # every request the way the access cookie is.
+    resp.set_cookie(
+        auth.REFRESH_COOKIE_NAME, refresh_token,
+        httponly=True, secure=cfg.COOKIE_SECURE, samesite="Lax",
+        max_age=cfg.JWT_REFRESH_TTL_DAYS * 86400, path="/auth",
+    )
+    return resp
+
+
+def _send_verification(user_id: int, email: str) -> None:
+    """Create a fresh email-verification token and email the confirmation link."""
+    raw_token = secrets.token_urlsafe(32)
+    expires = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+        minutes=cfg.EMAIL_VERIFICATION_TTL_MINUTES
+    )
+    db.create_email_verification_token(user_id, auth.hash_token(raw_token), expires)
+    auth.send_verification_email(email, raw_token)
+
+
+@app.route("/login", methods=["GET"])
+def login_page():
+    return render_template("login.html")
+
+
+@app.route("/register", methods=["GET"])
+def register_page():
+    return render_template("register.html")
+
+
+@app.route("/verify-email", methods=["GET"])
+def verify_email_page():
+    raw_token = request.args.get("token", "")
+    valid = db.get_valid_email_verification_token(auth.hash_token(raw_token)) if raw_token else None
+    if not valid:
+        return render_template("verify_email.html", success=False)
+
+    db.mark_user_verified(valid["user_id"])
+    db.mark_email_verification_token_used(valid["id"])
+    return render_template("verify_email.html", success=True)
+
+
+@app.route("/auth/register", methods=["POST"])
+@limiter.limit(cfg.REGISTER_RATE_LIMIT)
+def auth_register():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+
+    if not email or "@" not in email:
+        return jsonify({"error": "A valid email is required."}), 400
+    if len(password) < 8:
+        return jsonify({"error": "Password must be at least 8 characters."}), 400
+    if db.get_user_by_email(email):
+        return jsonify({"error": "An account with that email already exists."}), 409
+
+    user_id = db.create_user(email, auth.hash_password(password))
+    _send_verification(user_id, email)
+    return jsonify({
+        "ok": True,
+        "message": "Check your email for a link to verify your account before logging in.",
+    })
+
+
+@app.route("/auth/login", methods=["POST"])
+@limiter.limit(cfg.LOGIN_RATE_LIMIT)
+def auth_login():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+
+    user = db.get_user_by_email(email)
+    if not user or not user["is_active"] or not auth.verify_password(password, user["password_hash"]):
+        return jsonify({"error": "Invalid email or password."}), 401
+    if not user["email_verified"]:
+        return jsonify({
+            "error": "Please verify your email before logging in.",
+            "code": "email_not_verified",
+        }), 403
+
+    db.update_last_login(user["id"])
+    return _issue_auth_cookies(user["id"])
+
+
+@app.route("/auth/resend-verification", methods=["POST"])
+@limiter.limit(cfg.RESEND_VERIFICATION_RATE_LIMIT)
+def auth_resend_verification():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+
+    # Always return the same generic response whether or not the account exists/is
+    # already verified — otherwise this endpoint becomes an email-enumeration oracle.
+    generic_response = jsonify({
+        "ok": True,
+        "message": "If an unverified account with that email exists, a new link has been sent.",
+    })
+
+    user = db.get_user_by_email(email) if email else None
+    if user and user["is_active"] and not user["email_verified"]:
+        _send_verification(user["id"], user["email"])
+
+    return generic_response
+
+
+@app.route("/auth/refresh", methods=["POST"])
+def auth_refresh():
+    raw_token = request.cookies.get(auth.REFRESH_COOKIE_NAME)
+    if not raw_token:
+        return jsonify({"error": "Not authenticated."}), 401
+
+    token_hash = auth.hash_token(raw_token)
+    valid = db.get_valid_refresh_token(token_hash)
+    if not valid:
+        return jsonify({"error": "Not authenticated."}), 401
+
+    # Rotate: the old refresh token is single-use — revoke it, issue a fresh pair.
+    db.revoke_refresh_token(token_hash)
+    return _issue_auth_cookies(valid["user_id"])
+
+
+@app.route("/auth/logout", methods=["POST"])
+def auth_logout():
+    raw_token = request.cookies.get(auth.REFRESH_COOKIE_NAME)
+    if raw_token:
+        db.revoke_refresh_token(auth.hash_token(raw_token))
+    resp = make_response(jsonify({"ok": True}))
+    resp.delete_cookie(auth.ACCESS_COOKIE_NAME)
+    resp.delete_cookie(auth.REFRESH_COOKIE_NAME, path="/auth")
+    return resp
+
+
+@app.route("/forgot-password", methods=["GET"])
+def forgot_password_page():
+    return render_template("forgot_password.html")
+
+
+@app.route("/reset-password", methods=["GET"])
+def reset_password_page():
+    return render_template("reset_password.html")
+
+
+@app.route("/auth/forgot-password", methods=["POST"])
+@limiter.limit(cfg.FORGOT_PASSWORD_RATE_LIMIT)
+def auth_forgot_password():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+
+    # Always return the same generic response whether or not the account exists —
+    # otherwise this endpoint becomes an email-enumeration oracle.
+    generic_response = jsonify({
+        "ok": True,
+        "message": "If an account with that email exists, a reset link has been sent.",
+    })
+
+    user = db.get_user_by_email(email) if email else None
+    if user and user["is_active"]:
+        raw_token = secrets.token_urlsafe(32)
+        expires = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+            minutes=cfg.PASSWORD_RESET_TTL_MINUTES
+        )
+        db.create_password_reset_token(user["id"], auth.hash_token(raw_token), expires)
+        auth.send_password_reset_email(user["email"], raw_token)
+
+    return generic_response
+
+
+@app.route("/auth/reset-password", methods=["POST"])
+def auth_reset_password():
+    data = request.get_json(silent=True) or {}
+    raw_token = data.get("token") or ""
+    new_password = data.get("password") or ""
+
+    if len(new_password) < 8:
+        return jsonify({"error": "Password must be at least 8 characters."}), 400
+
+    valid = db.get_valid_password_reset_token(auth.hash_token(raw_token))
+    if not valid:
+        return jsonify({"error": "This reset link is invalid or has expired."}), 400
+
+    db.update_user_password(valid["user_id"], auth.hash_password(new_password))
+    db.mark_password_reset_token_used(valid["id"])
+    # A password reset is a "log out everywhere" signal — any stolen/leaked refresh
+    # token from before the reset should stop working.
+    db.revoke_all_refresh_tokens(valid["user_id"])
+
+    return jsonify({"ok": True})
+
+
 @app.route("/", methods=["GET", "POST"])
+@auth.login_required_page
 def index():
     results = None
     pubmed_query = None
     error = None
     user_query = ""
     max_results = cfg.MAX_RESULTS_DEFAULT
+    start_date = ""
+    end_date = ""
 
     if request.method == "POST":
         user_query = request.form.get("query", "").strip()
+        start_date = request.form.get("start_date", "").strip()
+        end_date = request.form.get("end_date", "").strip()
         if user_query:
             max_results = _clamp_max_results(request.form.get("max_results", str(cfg.MAX_RESULTS_DEFAULT)))
-            results, pubmed_query, error = _run_search(user_query, max_results)
+            if start_date and end_date and start_date > end_date:
+                error = "Start date must be on or before the end date."
+            else:
+                date_range = _normalize_date_range(start_date, end_date)
+                mindate, maxdate = date_range if date_range else (None, None)
+                results, pubmed_query, error = _run_search(user_query, max_results, mindate=mindate, maxdate=maxdate)
 
     return render_template(
         "index.html",
@@ -501,61 +766,16 @@ def index():
         results=results,
         error=error,
         max_results=max_results,
+        start_date=start_date,
+        end_date=end_date,
     )
 
 
 @app.route("/collections", methods=["GET"])
+@auth.login_required_page
 def collections():
-    items = db.list_collections()
+    items = db.list_collections(g.user_id)
     return render_template("collections.html", collections=items)
-
-
-@app.route("/collections", methods=["POST"])
-def collections_save():
-    """Receive selected articles, fetch PMC full text where available, chunk, embed, store."""
-    payload = request.get_json(force=True)
-    name = (payload.get("name") or "").strip()
-    user_query = payload.get("user_query", "")
-    pubmed_query = payload.get("pubmed_query", "")
-    articles = payload.get("articles", [])
-
-    if not name:
-        return {"error": "Collection name is required."}, 400
-    if not articles:
-        return {"error": "No articles to save."}, 400
-
-    try:
-        pmids = [a["pmid"] for a in articles]
-        pmcid_map = get_pmcids(pmids)
-        cid = db.create_collection(name, user_query, pubmed_query)
-
-        # Phase 1: fetch PMC full texts in parallel (I/O-bound network calls)
-        max_workers = min(len(articles), 8)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            fetched = list(executor.map(_fetch_article_text, articles, [pmcid_map] * len(articles)))
-
-        # Phase 2: persist article rows; collect chunks that still need embedding
-        pending: list[tuple[str, list[str]]] = []  # [(pmid, chunks), ...]
-        for art, full_text, pmcid in fetched:
-            db.add_article(cid, art, has_full_text=bool(full_text), pmcid=pmcid)
-            pmid = art["pmid"]
-            if not db.chunks_exist(pmid):
-                text_to_chunk = full_text or f"{art['title']}. {art['abstract']}"
-                pending.append((pmid, chunk_text(text_to_chunk, cfg.CHUNK_SIZE, cfg.CHUNK_OVERLAP)))
-
-        # Phase 3: embed all pending chunks in one batch, then save
-        if pending:
-            all_chunks = [c for _, chunks in pending for c in chunks]
-            all_embeddings = embed_texts(all_chunks)
-            offset = 0
-            for pmid, chunks in pending:
-                n = len(chunks)
-                db.save_chunks(pmid, chunks, all_embeddings[offset:offset + n])
-                offset += n
-
-        return {"id": cid}
-    except Exception as exc:
-        return {"error": str(exc)}, 500
 
 
 def _sse(payload: dict) -> str:
@@ -585,35 +805,50 @@ def _save_fetch_phase(articles: list[dict], pmcid_map: dict):
     return fetched, counts
 
 
-def _save_persist_phase(cid: int, fetched: list) -> list[tuple[str, list[str]]]:
-    """Insert article rows; return (pmid, chunks) pairs that still need embedding."""
-    pending: list[tuple[str, list[str]]] = []
+def _save_persist_phase(cid: int, fetched: list) -> list[tuple[str, list[str], bool]]:
+    """Insert article rows; return (pmid, chunks, is_full_text) triples that still need embedding."""
+    pending: list[tuple[str, list[str], bool]] = []
     for art, full_text, pmcid in fetched:
         db.add_article(cid, art, has_full_text=bool(full_text), pmcid=pmcid)
         pmid = art["pmid"]
         if not db.chunks_exist(pmid):
             text_to_chunk = full_text or f"{art['title']}. {art['abstract']}"
-            pending.append((pmid, chunk_text(text_to_chunk, cfg.CHUNK_SIZE, cfg.CHUNK_OVERLAP)))
+            chunks = chunk_text(text_to_chunk, cfg.CHUNK_SIZE, cfg.CHUNK_OVERLAP)
+            pending.append((pmid, chunks, bool(full_text)))
     return pending
 
 
-def _save_embed_phase(pending: list[tuple[str, list[str]]], counts: dict):
-    """Generator — yields SSE embedding event then embeds and saves all pending chunks."""
+def _save_embed_phase(pending: list[tuple[str, list[str], bool]]):
+    """Generator — yields SSE embedding progress events while embedding pending chunks in
+    batches, then saves them. Embedding in one un-chunked call for a large collection can run
+    long enough to trip gunicorn's worker timeout (it can't heartbeat mid-call); batching keeps
+    control returning to the SSE stream regularly."""
     if not pending:
         return
+    full_text_count = sum(1 for _, _, is_full_text in pending if is_full_text)
+    flat_chunks = [(pmid, chunk) for pmid, chunks, _ in pending for chunk in chunks]
+    total_chunks = len(flat_chunks)
     yield _sse({"type": "embedding", "count": len(pending),
-                "full_text": counts["full_text"],
-                "abstract": counts["abstract"] + counts["fallback"]})
-    all_chunks = [c for _, chunks in pending for c in chunks]
-    all_embeddings = embed_texts(all_chunks)
-    offset = 0
-    for pmid, chunks in pending:
-        n = len(chunks)
-        db.save_chunks(pmid, chunks, all_embeddings[offset:offset + n])
-        offset += n
+                "full_text": full_text_count,
+                "abstract": len(pending) - full_text_count,
+                "total_chunks": total_chunks})
+
+    embeddings_by_pmid: dict[str, list[np.ndarray]] = {pmid: [] for pmid, _, _ in pending}
+    done = 0
+    for start in range(0, total_chunks, cfg.EMBED_BATCH_SIZE):
+        batch = flat_chunks[start:start + cfg.EMBED_BATCH_SIZE]
+        vectors = embed_texts([text for _, text in batch])
+        for (pmid, _), vector in zip(batch, vectors):
+            embeddings_by_pmid[pmid].append(vector)
+        done += len(batch)
+        yield _sse({"type": "embedding_progress", "done": done, "total": total_chunks})
+
+    for pmid, chunks, _ in pending:
+        db.save_chunks(pmid, chunks, embeddings_by_pmid[pmid])
 
 
 @app.route("/collections/save-stream", methods=["POST"])
+@auth.login_required
 def collections_save_stream():
     """SSE endpoint: save collection with per-article fetch + embedding progress."""
     payload = request.get_json(force=True)
@@ -621,6 +856,7 @@ def collections_save_stream():
     user_query = payload.get("user_query", "")
     pubmed_query = payload.get("pubmed_query", "")
     articles = payload.get("articles", [])
+    user_id = g.user_id
 
     if not name:
         return {"error": "Collection name is required."}, 400
@@ -630,10 +866,10 @@ def collections_save_stream():
     def generate():
         try:
             pmcid_map = get_pmcids([a["pmid"] for a in articles])
-            cid = db.create_collection(name, user_query, pubmed_query)
+            cid = db.create_collection(name, user_query, pubmed_query, user_id)
             fetched, counts = yield from _save_fetch_phase(articles, pmcid_map)
             pending = _save_persist_phase(cid, fetched)
-            yield from _save_embed_phase(pending, counts)
+            yield from _save_embed_phase(pending)
             yield _sse({"type": "done", "id": cid, "count": len(articles), **counts})
         except Exception as exc:
             yield _sse({"type": "error", "message": str(exc)})
@@ -699,8 +935,9 @@ def generate_starter_questions(user_query: str, articles: list[dict]) -> list[st
 
 
 @app.route("/collections/<int:cid>", methods=["GET"])
+@auth.login_required_page
 def collection_detail(cid: int):
-    collection = db.get_collection(cid)
+    collection = db.get_collection(cid, g.user_id)
     if not collection:
         return "Collection not found", 404
     articles = db.get_collection_articles(cid)
@@ -712,8 +949,9 @@ def collection_detail(cid: int):
 
 
 @app.route("/collections/<int:cid>/export.csv", methods=["GET"])
+@auth.login_required
 def collection_export_csv(cid: int):
-    collection = db.get_collection(cid)
+    collection = db.get_collection(cid, g.user_id)
     if not collection:
         return "Collection not found", 404
     articles = db.get_collection_articles(cid)
@@ -740,11 +978,15 @@ def collection_export_csv(cid: int):
 
 
 @app.route("/collections/<int:cid>/starter-questions", methods=["GET"])
+@auth.login_required
 def collection_starter_questions(cid: int):
+    # Ownership must be checked before the cache lookup, not inside the cache-miss
+    # branch — otherwise a cache hit would skip authorization and leak another
+    # user's cached questions to anyone who guesses their cid.
+    collection = db.get_collection(cid, g.user_id)
+    if not collection:
+        return {"questions": []}
     if cid not in _starter_questions_cache:
-        collection = db.get_collection(cid)
-        if not collection:
-            return {"questions": []}
         articles = db.get_collection_articles(cid)
         _starter_questions_cache[cid] = generate_starter_questions(
             collection["user_query"], articles
@@ -899,18 +1141,38 @@ def _extract_answer_from_events(events: list[str]) -> str:
     return "".join(parts)
 
 
+_CONVERSATION_NOT_FOUND = "Conversation not found."
+
+
+def _get_owned_conversation(vid: int) -> dict | None:
+    """Return the conversation only if it exists AND its collection is owned by g.user_id."""
+    conv = db.get_conversation(vid)
+    if not conv or conv["user_id"] != g.user_id:
+        return None
+    return conv
+
+
 @app.route("/collections/<int:cid>/conversations", methods=["GET"])
+@auth.login_required
 def collection_conversations(cid: int):
+    if not db.get_collection(cid, g.user_id):
+        return {"error": "Collection not found."}, 404
     return db.list_conversations(cid)
 
 
 @app.route("/conversations/<int:vid>/messages", methods=["GET"])
+@auth.login_required
 def conversation_messages(vid: int):
+    if not _get_owned_conversation(vid):
+        return {"error": _CONVERSATION_NOT_FOUND}, 404
     return db.get_conversation_messages(vid)
 
 
 @app.route("/conversations/<int:vid>/rename", methods=["PATCH"])
+@auth.login_required
 def conversation_rename(vid: int):
+    if not _get_owned_conversation(vid):
+        return {"error": _CONVERSATION_NOT_FOUND}, 404
     data  = request.get_json(force=True)
     title = (data.get("title") or "").strip()
     if not title:
@@ -920,12 +1182,16 @@ def conversation_rename(vid: int):
 
 
 @app.route("/conversations/<int:vid>/delete", methods=["POST"])
+@auth.login_required
 def conversation_delete(vid: int):
+    if not _get_owned_conversation(vid):
+        return {"error": _CONVERSATION_NOT_FOUND}, 404
     db.delete_conversation(vid)
     return {"ok": True}
 
 
 @app.route("/api/models", methods=["GET"])
+@auth.login_required
 def api_models():
     """List chat models currently available: env-key-gated providers + discovered Ollama models."""
     models = [
@@ -936,8 +1202,11 @@ def api_models():
 
 
 @app.route("/collections/<int:cid>/ask", methods=["POST"])
+@auth.login_required
 def collection_ask(cid: int):
     """SSE endpoint: embeds question, retrieves top-k chunks, streams RAG answer."""
+    if not db.get_collection(cid, g.user_id):
+        return {"error": "Collection not found."}, 404
     data = request.get_json(force=True)
     question = (data.get("question") or "").strip()
     if not question:
@@ -946,6 +1215,13 @@ def collection_ask(cid: int):
     if model not in available_chat_models():
         model = cfg.DEFAULT_CHAT_MODEL
     conversation_id = data.get("conversation_id")
+    # A client-supplied conversation_id could belong to another user's conversation
+    # (or a different collection); only trust it if it's actually owned by this user
+    # and attached to this collection, otherwise start a fresh one.
+    if conversation_id is not None:
+        owned_conv = _get_owned_conversation(conversation_id)
+        if not owned_conv or owned_conv["collection_id"] != cid:
+            conversation_id = None
 
     q_emb = embed_texts([question])[0]
     top_chunks = db.semantic_search(cid, q_emb, k=cfg.SEMANTIC_SEARCH_K)
@@ -1031,8 +1307,9 @@ def collection_ask(cid: int):
 
 
 @app.route("/collections/<int:cid>/delete", methods=["POST"])
+@auth.login_required
 def collection_delete(cid: int):
-    db.delete_collection(cid)
+    db.delete_collection(cid, g.user_id)
     return {"ok": True}
 
 
@@ -1236,12 +1513,13 @@ def _build_docx(title: str, collection_name: str, created_at: str, messages: lis
 
 
 @app.route("/conversations/<int:vid>/export", methods=["GET"])
+@auth.login_required
 def conversation_export(vid: int):
     fmt = request.args.get("format", "docx").lower()
     if fmt not in ("docx", "rtf"):
         return {"error": "format must be 'docx' or 'rtf'"}, 400
 
-    conv = db.get_conversation(vid)
+    conv = _get_owned_conversation(vid)
     if not conv:
         return "Conversation not found", 404
 

@@ -24,8 +24,12 @@ import os
 
 # ── Provider credentials ──────────────────────────────────────────────────────
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY",    "")
+# Env var names, also referenced by CHAT_MODELS' "requires_key" entries below.
+_ANTHROPIC_API_KEY_ENV = "ANTHROPIC_API_KEY"
+_OPENAI_API_KEY_ENV    = "OPENAI_API_KEY"
+
+ANTHROPIC_API_KEY = os.getenv(_ANTHROPIC_API_KEY_ENV, "")
+OPENAI_API_KEY    = os.getenv(_OPENAI_API_KEY_ENV,    "")
 OLLAMA_BASE_URL   = os.getenv("OLLAMA_BASE_URL",   "http://localhost:11434")
 OLLAMA_API_KEY    = os.getenv("OLLAMA_API_KEY",    "")
 
@@ -33,50 +37,96 @@ OLLAMA_API_KEY    = os.getenv("OLLAMA_API_KEY",    "")
 # streaming chat requests (non-streaming calls return 401 Unauthorized).
 OLLAMA_CLOUD_BASE_URL = "https://ollama.com"
 
+# ── Auth ──────────────────────────────────────────────────────────────────────
+
+JWT_SECRET_KEY          = os.getenv("JWT_SECRET_KEY", "")
+JWT_ACCESS_TTL_MINUTES  = int(os.getenv("JWT_ACCESS_TTL_MINUTES", "30"))
+JWT_REFRESH_TTL_DAYS    = int(os.getenv("JWT_REFRESH_TTL_DAYS", "30"))
+JWT_ALGORITHM           = "HS256"
+
+# Whether auth cookies get the Secure flag (browser will refuse to send them over plain
+# HTTP if set). Defaults on — this app is meant to be served over TLS (see Dockerfile).
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "true").lower() != "false"
+
+# Signs the Flask session cookie that flask-wtf's CSRF token rides on — distinct from
+# JWT_SECRET_KEY on purpose (different subsystems shouldn't share a signing key).
+FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY", "")
+
+# flask-limiter uses in-memory (per-worker) storage — see README for the tradeoff.
+LOGIN_RATE_LIMIT                = os.getenv("LOGIN_RATE_LIMIT",                "5 per minute")
+REGISTER_RATE_LIMIT             = os.getenv("REGISTER_RATE_LIMIT",             "5 per hour")
+FORGOT_PASSWORD_RATE_LIMIT      = os.getenv("FORGOT_PASSWORD_RATE_LIMIT",      "3 per hour")  # NOSONAR
+RESEND_VERIFICATION_RATE_LIMIT  = os.getenv("RESEND_VERIFICATION_RATE_LIMIT",  "3 per hour")
+
+PASSWORD_RESET_TTL_MINUTES      = int(os.getenv("PASSWORD_RESET_TTL_MINUTES",      "60"))  # NOSONAR
+EMAIL_VERIFICATION_TTL_MINUTES  = int(os.getenv("EMAIL_VERIFICATION_TTL_MINUTES",  "1440"))
+
+# ── Email (SMTP2GO HTTP API — https://api.smtp2go.com/v3/email/send) ──────────
+# Registration requires clicking the emailed link before the account can log in;
+# SMTP2GO_API unset just means the account is created but the email never
+# arrives (logged, not an error) — fine for local dev, sign in blocked until an
+# admin verifies the row directly.
+
+SMTP2GO_API = os.getenv("SMTP2GO_API", "")
+EMAIL_FROM  = os.getenv("EMAIL_FROM", "PubMed AI <noreply@localhost>")
+
+# Base URL used to build the verification / password-reset links in emails
+# (e.g. https://host:8080). No trailing slash.
+APP_BASE_URL = os.getenv("APP_BASE_URL", "https://localhost:8080")
+
 # ── Models ────────────────────────────────────────────────────────────────────
 
-QUERY_BUILDER_MODEL     = os.getenv("QUERY_BUILDER_MODEL",     "claude-opus-4-6")
-STARTER_QUESTIONS_MODEL = os.getenv("STARTER_QUESTIONS_MODEL", "claude-opus-4-6")
-DEFAULT_CHAT_MODEL      = os.getenv("DEFAULT_CHAT_MODEL",      "claude-opus-4-6")
+# Also used as the CHAT_MODELS key for this model below.
+_DEFAULT_MODEL_ID = "claude-opus-4-6"
 
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+QUERY_BUILDER_MODEL     = os.getenv("QUERY_BUILDER_MODEL",     _DEFAULT_MODEL_ID)
+STARTER_QUESTIONS_MODEL = os.getenv("STARTER_QUESTIONS_MODEL", _DEFAULT_MODEL_ID)
+DEFAULT_CHAT_MODEL      = os.getenv("DEFAULT_CHAT_MODEL",      _DEFAULT_MODEL_ID)
+
+# NeuML/pubmedbert-base-embeddings — PubMedBERT fine-tuned for biomedical semantic
+# search, trained specifically on PubMed title/abstract pairs. Only ships
+# PyTorch/safetensors weights (no ONNX), so it's loaded via sentence-transformers
+# rather than fastembed. 768-dim — EMBEDDING_DIM below must match whatever model
+# is configured here, since it's baked into the article_chunks.embedding column type.
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "NeuML/pubmedbert-base-embeddings")
+EMBEDDING_DIM   = int(os.getenv("EMBEDDING_DIM", "768"))
 
 # All chat models available for selection. Entries whose requires_key env var is
 # not set at startup are hidden from the UI. Ollama models are appended at
 # runtime via dynamic discovery (see app.py:available_chat_models).
 CHAT_MODELS: dict[str, dict] = {
-    "claude-opus-4-6": {
+    _DEFAULT_MODEL_ID: {
         "display":      "Opus 4.6",
         "provider":     "anthropic",
-        "requires_key": "ANTHROPIC_API_KEY",
+        "requires_key": _ANTHROPIC_API_KEY_ENV,
         "input_price":  15.00,
         "output_price": 75.00,
     },
     "claude-sonnet-4-6": {
         "display":      "Sonnet 4.6",
         "provider":     "anthropic",
-        "requires_key": "ANTHROPIC_API_KEY",
+        "requires_key": _ANTHROPIC_API_KEY_ENV,
         "input_price":   3.00,
         "output_price": 15.00,
     },
     "claude-haiku-4-5-20251001": {
         "display":      "Haiku 4.5",
         "provider":     "anthropic",
-        "requires_key": "ANTHROPIC_API_KEY",
+        "requires_key": _ANTHROPIC_API_KEY_ENV,
         "input_price":   0.80,
         "output_price":  4.00,
     },
     "gpt-4o": {
         "display":      "GPT-4o",
         "provider":     "openai",
-        "requires_key": "OPENAI_API_KEY",
+        "requires_key": _OPENAI_API_KEY_ENV,
         "input_price":   2.50,
         "output_price": 10.00,
     },
     "o3": {
         "display":      "o3",
         "provider":     "openai",
-        "requires_key": "OPENAI_API_KEY",
+        "requires_key": _OPENAI_API_KEY_ENV,
         "input_price":  10.00,
         "output_price": 40.00,
     },
@@ -113,12 +163,12 @@ MAX_RESULTS_MAX     = 200
 SEMANTIC_SEARCH_K   = 5   # top-k chunks retrieved per RAG query
 
 # ── Embedding ────────────────────────────────────────────────────────────────
-# EMBED_THREADS caps the ONNX Runtime thread pool — the primary lever for
+# EMBED_THREADS caps PyTorch's intra-op CPU thread pool — the primary lever for
 # preventing CPU spikes in memory-constrained containers. Set to 1 to keep
 # CPU usage flat; raise to 2-4 if the host has spare cores.
-# EMBED_BATCH_SIZE controls texts per ONNX forward pass (default upstream: 256).
-# Lowering it reduces peak memory and smooths CPU load at the cost of
-# slightly longer total embedding time.
+# EMBED_BATCH_SIZE controls texts per encode() forward pass. Lowering it reduces
+# peak memory and smooths CPU load at the cost of slightly longer total
+# embedding time.
 
 EMBED_THREADS    = int(os.environ.get("EMBED_THREADS",    "1"))
 EMBED_BATCH_SIZE = int(os.environ.get("EMBED_BATCH_SIZE", "32"))

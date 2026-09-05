@@ -11,13 +11,14 @@ Searching PubMed manually requires knowing MeSH terms, Boolean operators, and fi
 
 1. **Type a research question in plain English** — e.g. *"What is the role of gut microbiome in Parkinson's disease?"*
 2. **Claude translates it** into an optimized PubMed query using MeSH terms and Boolean logic (extended thinking mode, so it reasons before answering).
-3. **NCBI returns up to 200 articles**; each abstract is embedded and ranked by cosine similarity to your original question.
-4. **You review and select** the most relevant articles, set a relevance threshold with a slider, and save them as a named collection.
-5. **The collection becomes a knowledge base** — full-text PMC articles are fetched where available, chunked, embedded, and stored in pgvector.
-6. **Chat with your collection** — ask follow-up questions and get cited, streamed answers grounded in the papers you saved. Inline citation markers like `[1]` are rendered as clickable superscript links that open the source article directly. Claude suggests four follow-up questions after every answer.
-7. **Conversations are saved** — every chat thread is persisted to the database. A sidebar lists past conversations by title and date; click any entry to pick up where you left off, or start a fresh thread with the **+** button. Hover over a conversation to rename it inline with the pencil icon (✎) or delete it with the × button.
-8. **Export a conversation** — click **Save ▾** in the chat toolbar to download the current conversation as a Word (`.docx`) or RTF (`.rtf`) file, including the question/answer history and metadata.
-9. **Download collection metadata** — click **↓ CSV** at the top of the article list panel to download all articles in the collection as a CSV file (PMID, Journal, Title, Year, Authors, Abstract). The file is named after the collection and encoded as UTF-8 with BOM for Excel compatibility.
+3. **Optionally narrow by publication date** — an optional date-range picker restricts results to articles published between two dates; left blank, all dates are searched.
+4. **NCBI returns up to 200 articles**; each abstract is embedded and ranked by cosine similarity to your original question.
+5. **You review and select** the most relevant articles, set a relevance threshold with a slider, and save them as a named collection. Saving streams live progress — a PMC full-text fetch event per article, then a per-batch embedding progress event — so the progress bar advances smoothly even for large (up to 200-article) collections.
+6. **The collection becomes a knowledge base** — full-text PMC articles are fetched where available, chunked, embedded, and stored in pgvector. The collection list shows each collection's article count split into "N full text" and "N abstract only" badges, so you can see the full-text/abstract-only mix without opening it.
+7. **Chat with your collection** — ask follow-up questions and get cited, streamed answers grounded in the papers you saved. Inline citation markers like `[1]` are rendered as clickable superscript links that open the source article directly. Claude suggests four follow-up questions after every answer.
+8. **Conversations are saved** — every chat thread is persisted to the database. A sidebar lists past conversations by title and date; click any entry to pick up where you left off, or start a fresh thread with the **+** button. Hover over a conversation to rename it inline with the pencil icon (✎) or delete it with the × button.
+9. **Export a conversation** — click **Save ▾** in the chat toolbar to download the current conversation as a Word (`.docx`) or RTF (`.rtf`) file, including the question/answer history and metadata.
+10. **Download collection metadata** — click **↓ CSV** at the top of the article list panel to download all articles in the collection as a CSV file (PMID, Journal, Title, Year, Authors, Abstract). The file is named after the collection and encoded as UTF-8 with BOM for Excel compatibility.
 
 ---
 
@@ -118,8 +119,9 @@ QUERY_BUILDER_MODEL=claude-opus-4-6
 STARTER_QUESTIONS_MODEL=claude-opus-4-6
 DEFAULT_CHAT_MODEL=claude-opus-4-6
 
-# Optional — override the embedding model
-EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
+# Optional — override the embedding model (changing this to a model with a
+# different output dimension requires re-running scripts/migrate_embedding_dim.py)
+EMBEDDING_MODEL=NeuML/pubmedbert-base-embeddings
 ```
 
 See [Environment Variables](#environment-variables) below for the full list, including auth token lifetimes and rate limits.
@@ -141,6 +143,8 @@ python app.py
 Open [http://127.0.0.1:8080](http://127.0.0.1:8080). Every page requires an account — register one at `/register` and click the verification link emailed to you before you can log in, or run `python -m scripts.bootstrap_admin` to create/promote a specific account (auto-verified, skips the email step; it also reassigns any pre-auth collections, `user_id IS NULL`, to that account).
 
 The first search will download the `NeuML/pubmedbert-base-embeddings` embedding model into `~/.cache/huggingface`. Subsequent starts are instant.
+
+If you're upgrading an existing database from an older embedding model, run `python scripts/migrate_embedding_dim.py` once to resize `article_chunks.embedding` and re-embed existing chunks with the currently configured model.
 
 ---
 
@@ -233,22 +237,20 @@ Browser
 Flask (app.py)
   ├── GET/POST /                         Search page
   │     ├── Claude (Opus 4.6)       ──►  PubMed query (MeSH + Boolean, extended thinking)
-  │     ├── NCBI esearch/efetch     ──►  Titles, authors, abstracts
-  │     └── fastembed               ──►  Cosine similarity ranking
-  │
-  ├── POST /collections                  Save selected articles (synchronous)
-  │     ├── NCBI elink/efetch       ──►  PMC full text
-  │     ├── chunk_text()            ──►  1 000-char chunks, 200-char overlap
-  │     ├── fastembed               ──►  Batch-embed all chunks in one call
-  │     └── pgvector                ──►  Batch-insert embeddings (execute_values)
+  │     ├── NCBI esearch/efetch     ──►  Titles, authors, abstracts (optional pubdate range)
+  │     └── sentence-transformers   ──►  Cosine similarity ranking
   │
   ├── POST /collections/save-stream      Save selected articles (SSE progress stream)
   │     ├── Phase 1 — parallel PMC fetches (as_completed), yields fetch event per article
   │     ├── Phase 2 — DB inserts (no event, fast)
-  │     └── Phase 3 — batch embed + pgvector insert, yields embedding then done events
+  │     └── Phase 3 — chunk_text() (1 000-char chunks, 200-char overlap), then
+  │                    embed in EMBED_BATCH_SIZE-sized batches, yielding an
+  │                    embedding_progress event per batch (keeps gunicorn's sync
+  │                    worker heartbeating on large collections) + pgvector
+  │                    batch-insert (execute_values), then a done event
   │
   ├── POST /collections/<id>/ask         Chat with a collection (SSE)
-  │     ├── fastembed               ──►  Embed question
+  │     ├── sentence-transformers   ──►  Embed question
   │     ├── pgvector                ──►  Top-5 chunk retrieval (HNSW index)
   │     ├── Claude (selectable)     ──►  Streamed cited answer + 4 follow-up suggestions
   │     └── db.add_message()        ──►  Persist user + assistant messages
@@ -260,6 +262,7 @@ Flask (app.py)
   ├── GET  /conversations/<id>/messages          Load a conversation's message history
   ├── PATCH /conversations/<id>/rename           Rename a conversation
   ├── POST /conversations/<id>/delete            Delete a conversation
+  ├── POST /collections/<id>/delete              Delete a collection
   └── GET  /conversations/<id>/export?format=…  Download conversation as .docx or .rtf
 
 Database (PostgreSQL + pgvector)
@@ -275,7 +278,7 @@ Database (PostgreSQL + pgvector)
 
 ### Embedding model
 
-`BAAI/bge-small-en-v1.5` (384-dimensional vectors) via [fastembed](https://github.com/qdrant/fastembed). Used for both indexing article chunks and embedding queries at search/ask time.
+`NeuML/pubmedbert-base-embeddings` (768-dimensional vectors) via [sentence-transformers](https://www.sbert.net/) — PubMedBERT fine-tuned on PubMed title/abstract pairs, chosen for biomedical domain relevance over general-purpose embedding models. Used for both indexing article chunks and embedding queries at search/ask time. The model is cached in `~/.cache/huggingface` and pre-baked into the Docker image. Switching to a model with a different output dimension requires running `scripts/migrate_embedding_dim.py` to resize `article_chunks.embedding` and re-embed existing chunks.
 
 ### Chat models
 
@@ -317,7 +320,9 @@ Dockerfile
 .dockerignore
 
 scripts/
-  bootstrap_admin.py     # One-time: create/promote an admin user, reassign pre-auth collections
+  bootstrap_admin.py         # One-time: create/promote an admin user, reassign pre-auth collections
+  migrate_embedding_dim.py   # Re-runnable: resize article_chunks.embedding and re-embed chunks
+                             # after changing EMBEDDING_MODEL to a model with a different dimension
 
 templates/
   base.html              # Shared layout (progress bar, CSRF meta tag, account bar, breadcrumbs, nav)
